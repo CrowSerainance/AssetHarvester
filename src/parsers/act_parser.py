@@ -1,0 +1,732 @@
+# ==============================================================================
+# ACT PARSER MODULE
+# ==============================================================================
+# Parser for Ragnarok Online ACT (Action) files.
+#
+# ACT files define how sprites are animated and displayed. They work together
+# with SPR files to create animated characters, monsters, and effects.
+#
+# Key Concepts:
+#   - Action: A complete animation (e.g., "walk", "attack", "die")
+#   - Frame: A single moment in an animation (one "frame" of animation)
+#   - Layer: A sprite layer within a frame (characters have body, head, etc.)
+#   - Anchor: Attachment points for connecting sprites together
+#
+# File Structure:
+#   - Header: Signature "AC" + version + action count
+#   - Actions: Each action contains multiple frames
+#   - Frames: Each frame contains multiple layers + timing info
+#   - Layers: Each layer references an SPR frame with transform data
+#   - Events: Sound/effect triggers (in later versions)
+#   - Anchors: Attachment points for combining sprites
+#
+# References:
+#   - https://ragnarokresearchlab.github.io/file-formats/act/
+#   - https://github.com/vthibault/roBrowser
+#   - https://github.com/zhad3/zrenderer
+#
+# Usage Example:
+#   parser = ACTParser()
+#   action_data = parser.load("data/sprite/npc/merchant.act")
+#   
+#   # Get frame 0 of action 0 (usually "stand")
+#   frame = action_data.get_frame(action_index=0, frame_index=0)
+#   
+#   # Iterate through layers to composite the sprite
+#   for layer in frame.layers:
+#       print(f"SPR frame {layer.sprite_index} at ({layer.x}, {layer.y})")
+# ==============================================================================
+
+import struct
+from typing import List, Optional, Tuple, BinaryIO
+from dataclasses import dataclass, field
+
+
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+
+# ACT file signature (first 2 bytes)
+ACT_SIGNATURE = b"AC"
+
+# ACT version constants
+ACT_VERSION_2_0 = (2, 0)  # Basic version
+ACT_VERSION_2_1 = (2, 1)  # Added sound events
+ACT_VERSION_2_3 = (2, 3)  # Added more layer properties
+ACT_VERSION_2_4 = (2, 4)  # Added anchors
+ACT_VERSION_2_5 = (2, 5)  # Current version with all features
+
+
+# ==============================================================================
+# STANDARD ACTION INDICES
+# ==============================================================================
+# These are the standard action indices used by player characters in RO.
+# Monster and NPC actions may differ.
+
+class ActionIndex:
+    """
+    Standard action indices for player characters.
+    
+    RO uses a consistent action numbering for player sprites:
+    - 8 directions per action (south, SW, west, NW, north, NE, east, SE)
+    - Actions repeat every 8 indices for each direction
+    
+    Direction order:
+        0 = South (facing camera)
+        1 = South-West
+        2 = West
+        3 = North-West
+        4 = North (facing away)
+        5 = North-East
+        6 = East
+        7 = South-East
+    """
+    # Standing/Idle - Actions 0-7
+    STAND_S = 0
+    STAND_SW = 1
+    STAND_W = 2
+    STAND_NW = 3
+    STAND_N = 4
+    STAND_NE = 5
+    STAND_E = 6
+    STAND_SE = 7
+    
+    # Walking - Actions 8-15
+    WALK_S = 8
+    WALK_SW = 9
+    WALK_W = 10
+    WALK_NW = 11
+    WALK_N = 12
+    WALK_NE = 13
+    WALK_E = 14
+    WALK_SE = 15
+    
+    # Sitting - Actions 16-23
+    SIT_S = 16
+    SIT_SW = 17
+    SIT_W = 18
+    SIT_NW = 19
+    SIT_N = 20
+    SIT_NE = 21
+    SIT_E = 22
+    SIT_SE = 23
+    
+    # Picking up item - Actions 24-31
+    PICKUP_S = 24
+    PICKUP_SW = 25
+    PICKUP_W = 26
+    PICKUP_NW = 27
+    PICKUP_N = 28
+    PICKUP_NE = 29
+    PICKUP_E = 30
+    PICKUP_SE = 31
+    
+    # Ready stance (combat) - Actions 32-39
+    READY_S = 32
+    READY_SW = 33
+    READY_W = 34
+    READY_NW = 35
+    READY_N = 36
+    READY_NE = 37
+    READY_E = 38
+    READY_SE = 39
+    
+    # Attack 1 - Actions 40-47
+    ATTACK1_S = 40
+    ATTACK1_SW = 41
+    ATTACK1_W = 42
+    ATTACK1_NW = 43
+    ATTACK1_N = 44
+    ATTACK1_NE = 45
+    ATTACK1_E = 46
+    ATTACK1_SE = 47
+    
+    # Hurt/Receiving damage - Actions 48-55
+    HURT_S = 48
+    HURT_SW = 49
+    HURT_W = 50
+    HURT_NW = 51
+    HURT_N = 52
+    HURT_NE = 53
+    HURT_E = 54
+    HURT_SE = 55
+    
+    # Freeze/Stun - Actions 56-63 (varies by class)
+    
+    # Dead/Lying - Actions 64-71
+    DEAD_S = 64
+    DEAD_SW = 65
+    DEAD_W = 66
+    DEAD_NW = 67
+    DEAD_N = 68
+    DEAD_NE = 69
+    DEAD_E = 70
+    DEAD_SE = 71
+    
+    # Casting - Actions 72-79
+    CAST_S = 72
+    CAST_SW = 73
+    CAST_W = 74
+    CAST_NW = 75
+    CAST_N = 76
+    CAST_NE = 77
+    CAST_E = 78
+    CAST_SE = 79
+    
+    # Attack 2 - Actions 80-87
+    ATTACK2_S = 80
+    ATTACK2_SW = 81
+    ATTACK2_W = 82
+    ATTACK2_NW = 83
+    ATTACK2_N = 84
+    ATTACK2_NE = 85
+    ATTACK2_E = 86
+    ATTACK2_SE = 87
+    
+    # Attack 3 - Actions 88-95
+    ATTACK3_S = 88
+    ATTACK3_SW = 89
+    ATTACK3_W = 90
+    ATTACK3_NW = 91
+    ATTACK3_N = 92
+    ATTACK3_NE = 93
+    ATTACK3_E = 94
+    ATTACK3_SE = 95
+
+
+# ==============================================================================
+# DATA CLASSES
+# ==============================================================================
+
+@dataclass
+class ACTLayer:
+    """
+    Represents a single sprite layer within an animation frame.
+    
+    Each layer draws one sprite (from the SPR file) at a specific position
+    with optional transformations like flipping, rotation, scaling, and tinting.
+    
+    Multiple layers are composited back-to-front to form the complete frame.
+    For example, a character might have separate layers for shadow, body,
+    head, and headgear.
+    
+    Attributes:
+        x (int):            X offset from frame center
+        y (int):            Y offset from frame center
+        sprite_index (int): Index of the sprite frame in the SPR file
+        mirror (bool):      Whether to flip the sprite horizontally
+        scale_x (float):    Horizontal scale factor (1.0 = normal)
+        scale_y (float):    Vertical scale factor (1.0 = normal)
+        rotation (int):     Rotation in degrees (0-360)
+        sprite_type (int):  0 = indexed sprite, 1 = RGBA sprite
+        width (int):        Display width (if different from sprite)
+        height (int):       Display height (if different from sprite)
+        color (tuple):      RGBA color tint (255, 255, 255, 255 = no tint)
+    """
+    x: int = 0
+    y: int = 0
+    sprite_index: int = 0
+    mirror: bool = False
+    scale_x: float = 1.0
+    scale_y: float = 1.0
+    rotation: int = 0
+    sprite_type: int = 0  # 0 = indexed, 1 = rgba
+    width: int = 0
+    height: int = 0
+    color: Tuple[int, int, int, int] = (255, 255, 255, 255)  # RGBA tint
+    
+    def is_flipped(self) -> bool:
+        """Check if layer is horizontally mirrored."""
+        return self.mirror
+    
+    def get_scale(self) -> Tuple[float, float]:
+        """Get scale factors as (x, y) tuple."""
+        return (self.scale_x, self.scale_y)
+
+
+@dataclass
+class ACTAnchor:
+    """
+    Represents an anchor point for attaching sprites together.
+    
+    Anchors are used to connect different sprite parts:
+    - Body anchor connects to head
+    - Head anchor connects to headgear
+    - Weapon anchors position weapon sprites
+    
+    Attributes:
+        x (int): X coordinate of anchor point
+        y (int): Y coordinate of anchor point
+        attr (int): Anchor attribute/type (unknown purpose)
+    """
+    x: int = 0
+    y: int = 0
+    attr: int = 0
+
+
+@dataclass
+class ACTEvent:
+    """
+    Represents a sound or effect event trigger.
+    
+    Events are triggered at specific frames during animation playback.
+    They're typically used for footstep sounds, attack impact sounds, etc.
+    
+    Attributes:
+        name (str): Sound file name or event identifier
+    """
+    name: str = ""
+
+
+@dataclass
+class ACTFrame:
+    """
+    Represents a single frame within an action.
+    
+    A frame is one "moment" in an animation. It contains:
+    - Multiple layers (sprites) composited together
+    - Timing information (how long to display)
+    - Event triggers (sounds, effects)
+    - Anchor points (for connecting sprites)
+    
+    Attributes:
+        layers (list):      List of ACTLayer objects to draw
+        event_id (int):     Index into the events list (-1 = no event)
+        anchors (list):     List of ACTAnchor points
+        delay (float):      Frame delay in milliseconds (25ms default)
+                           This is actually "interval" - frames are shown
+                           for this duration before advancing
+    """
+    layers: List[ACTLayer] = field(default_factory=list)
+    event_id: int = -1
+    anchors: List[ACTAnchor] = field(default_factory=list)
+    delay: float = 25.0  # Default 25ms = 40 FPS
+    
+    def get_layer_count(self) -> int:
+        """Get number of layers in this frame."""
+        return len(self.layers)
+    
+    def get_anchor(self, index: int) -> Optional[ACTAnchor]:
+        """Get anchor by index."""
+        if 0 <= index < len(self.anchors):
+            return self.anchors[index]
+        return None
+
+
+@dataclass
+class ACTAction:
+    """
+    Represents a complete animation action.
+    
+    An action is a sequence of frames that play in order to create
+    an animation. Examples: walking cycle, attack animation, idle loop.
+    
+    Attributes:
+        frames (list): List of ACTFrame objects in playback order
+    """
+    frames: List[ACTFrame] = field(default_factory=list)
+    
+    def get_frame_count(self) -> int:
+        """Get number of frames in this action."""
+        return len(self.frames)
+    
+    def get_frame(self, index: int) -> Optional[ACTFrame]:
+        """Get frame by index."""
+        if 0 <= index < len(self.frames):
+            return self.frames[index]
+        return None
+    
+    def get_total_duration(self) -> float:
+        """
+        Calculate total animation duration in milliseconds.
+        
+        Returns:
+            Sum of all frame delays
+        """
+        return sum(frame.delay for frame in self.frames)
+
+
+@dataclass
+class ACTData:
+    """
+    Represents a complete ACT file.
+    
+    Contains all actions, events, and frame intervals for a sprite.
+    
+    Attributes:
+        version (tuple):      ACT format version as (major, minor)
+        actions (list):       List of ACTAction objects
+        events (list):        List of ACTEvent objects (sound names)
+        frame_intervals (list): Default intervals for each action
+        filepath (str):       Original file path (for reference)
+    """
+    version: Tuple[int, int] = (2, 5)
+    actions: List[ACTAction] = field(default_factory=list)
+    events: List[ACTEvent] = field(default_factory=list)
+    frame_intervals: List[float] = field(default_factory=list)
+    filepath: str = ""
+    
+    def get_action_count(self) -> int:
+        """Get total number of actions."""
+        return len(self.actions)
+    
+    def get_action(self, index: int) -> Optional[ACTAction]:
+        """Get action by index."""
+        if 0 <= index < len(self.actions):
+            return self.actions[index]
+        return None
+    
+    def get_frame(self, action_index: int, frame_index: int) -> Optional[ACTFrame]:
+        """
+        Get a specific frame from an action.
+        
+        Args:
+            action_index: Index of the action (0-based)
+            frame_index: Index of the frame within the action (0-based)
+            
+        Returns:
+            ACTFrame if valid indices, None otherwise
+        """
+        action = self.get_action(action_index)
+        if action:
+            return action.get_frame(frame_index)
+        return None
+    
+    def get_event_name(self, event_id: int) -> str:
+        """Get event/sound name by ID."""
+        if 0 <= event_id < len(self.events):
+            return self.events[event_id].name
+        return ""
+
+
+# ==============================================================================
+# ACT PARSER CLASS
+# ==============================================================================
+
+class ACTParser:
+    """
+    Parser for Ragnarok Online ACT action/animation files.
+    
+    This class handles reading and decoding ACT files, including:
+    - Version detection and handling
+    - Action, frame, and layer parsing
+    - Event and anchor extraction
+    - Frame interval calculations
+    
+    Usage:
+        parser = ACTParser()
+        
+        # Load from file path
+        act_data = parser.load("path/to/sprite.act")
+        
+        # Or load from bytes
+        act_data = parser.load_from_bytes(act_bytes)
+        
+        # Access animation data
+        action = act_data.get_action(0)
+        frame = action.get_frame(0)
+        for layer in frame.layers:
+            print(f"Draw sprite {layer.sprite_index}")
+    """
+    
+    def __init__(self):
+        """Initialize the ACT parser."""
+        pass
+    
+    def load(self, filepath: str) -> Optional[ACTData]:
+        """
+        Load an ACT file from disk.
+        
+        Args:
+            filepath: Path to the .act file
+            
+        Returns:
+            ACTData object if successful, None on error
+        """
+        try:
+            with open(filepath, 'rb') as f:
+                data = f.read()
+            
+            act_data = self.load_from_bytes(data)
+            if act_data:
+                act_data.filepath = filepath
+            return act_data
+            
+        except FileNotFoundError:
+            print(f"[ERROR] ACT file not found: {filepath}")
+            return None
+        except Exception as e:
+            print(f"[ERROR] Failed to load ACT {filepath}: {e}")
+            return None
+    
+    def load_from_bytes(self, data: bytes) -> Optional[ACTData]:
+        """
+        Load ACT data from raw bytes.
+        
+        This is useful when reading directly from GRF archives.
+        
+        Args:
+            data: Raw ACT file bytes
+            
+        Returns:
+            ACTData object if successful, None on error
+        """
+        try:
+            # Check minimum size
+            if len(data) < 10:
+                print("[ERROR] ACT data too small")
+                return None
+            
+            # Check signature
+            if data[0:2] != ACT_SIGNATURE:
+                print(f"[ERROR] Invalid ACT signature: {data[0:2]}")
+                return None
+            
+            # Read version (minor byte, major byte - little endian)
+            version_minor = data[2]
+            version_major = data[3]
+            version = (version_major, version_minor)
+            
+            # Read action count
+            action_count = struct.unpack('<H', data[4:6])[0]
+            
+            # Skip reserved bytes (10 bytes of zeros in most versions)
+            offset = 6
+            if version >= ACT_VERSION_2_0:
+                offset = 16
+            
+            # Create ACT data object
+            act_data = ACTData(version=version)
+            
+            # Parse each action
+            for i in range(action_count):
+                action, offset = self._read_action(data, offset, version)
+                act_data.actions.append(action)
+            
+            # Read events (sound names) if version supports it
+            if version >= ACT_VERSION_2_1 and offset < len(data):
+                event_count = struct.unpack('<I', data[offset:offset + 4])[0]
+                offset += 4
+                
+                for i in range(event_count):
+                    event_name, offset = self._read_string(data, offset, 40)
+                    act_data.events.append(ACTEvent(name=event_name))
+            
+            # Read frame intervals if present
+            if version >= ACT_VERSION_2_3 and offset < len(data):
+                for action in act_data.actions:
+                    if offset + 4 <= len(data):
+                        interval = struct.unpack('<f', data[offset:offset + 4])[0]
+                        act_data.frame_intervals.append(interval)
+                        offset += 4
+            
+            return act_data
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to parse ACT data: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _read_action(self, data: bytes, offset: int, 
+                     version: Tuple[int, int]) -> Tuple[ACTAction, int]:
+        """
+        Read a single action from ACT data.
+        
+        Args:
+            data: Full ACT file data
+            offset: Current read position
+            version: ACT file version
+            
+        Returns:
+            Tuple of (ACTAction, new_offset)
+        """
+        action = ACTAction()
+        
+        # Read frame count
+        frame_count = struct.unpack('<I', data[offset:offset + 4])[0]
+        offset += 4
+        
+        # Parse each frame
+        for i in range(frame_count):
+            frame, offset = self._read_frame(data, offset, version)
+            action.frames.append(frame)
+        
+        return action, offset
+    
+    def _read_frame(self, data: bytes, offset: int,
+                    version: Tuple[int, int]) -> Tuple[ACTFrame, int]:
+        """
+        Read a single frame from ACT data.
+        
+        Args:
+            data: Full ACT file data
+            offset: Current read position
+            version: ACT file version
+            
+        Returns:
+            Tuple of (ACTFrame, new_offset)
+        """
+        frame = ACTFrame()
+        
+        # Skip unknown data (4 bytes in most versions)
+        offset += 4
+        
+        # Read layer count
+        layer_count = struct.unpack('<I', data[offset:offset + 4])[0]
+        offset += 4
+        
+        # Parse each layer
+        for i in range(layer_count):
+            layer, offset = self._read_layer(data, offset, version)
+            frame.layers.append(layer)
+        
+        # Read event ID (int32, -1 = no event)
+        if version >= ACT_VERSION_2_0:
+            frame.event_id = struct.unpack('<i', data[offset:offset + 4])[0]
+            offset += 4
+        
+        # Read anchors (version 2.4+)
+        if version >= ACT_VERSION_2_4:
+            anchor_count = struct.unpack('<I', data[offset:offset + 4])[0]
+            offset += 4
+            
+            for i in range(anchor_count):
+                # Each anchor: unknown (4 bytes) + x (4 bytes) + y (4 bytes) + attr (4 bytes)
+                offset += 4  # Skip unknown
+                x = struct.unpack('<i', data[offset:offset + 4])[0]
+                offset += 4
+                y = struct.unpack('<i', data[offset:offset + 4])[0]
+                offset += 4
+                attr = struct.unpack('<i', data[offset:offset + 4])[0]
+                offset += 4
+                
+                frame.anchors.append(ACTAnchor(x=x, y=y, attr=attr))
+        
+        return frame, offset
+    
+    def _read_layer(self, data: bytes, offset: int,
+                    version: Tuple[int, int]) -> Tuple[ACTLayer, int]:
+        """
+        Read a single layer from ACT data.
+        
+        Args:
+            data: Full ACT file data
+            offset: Current read position
+            version: ACT file version
+            
+        Returns:
+            Tuple of (ACTLayer, new_offset)
+        """
+        layer = ACTLayer()
+        
+        # Read position (x, y as int32)
+        layer.x = struct.unpack('<i', data[offset:offset + 4])[0]
+        offset += 4
+        layer.y = struct.unpack('<i', data[offset:offset + 4])[0]
+        offset += 4
+        
+        # Read sprite index (int32)
+        layer.sprite_index = struct.unpack('<i', data[offset:offset + 4])[0]
+        offset += 4
+        
+        # Read mirror flag (int32, 0 or 1)
+        mirror_val = struct.unpack('<i', data[offset:offset + 4])[0]
+        layer.mirror = (mirror_val != 0)
+        offset += 4
+        
+        # Version 2.0+ has additional properties
+        if version >= ACT_VERSION_2_0:
+            # Read color (RGBA, 4 bytes)
+            r = data[offset]
+            g = data[offset + 1]
+            b = data[offset + 2]
+            a = data[offset + 3]
+            layer.color = (r, g, b, a)
+            offset += 4
+            
+            # Read scale (x, y as float32)
+            layer.scale_x = struct.unpack('<f', data[offset:offset + 4])[0]
+            offset += 4
+            layer.scale_y = struct.unpack('<f', data[offset:offset + 4])[0]
+            offset += 4
+            
+            # Read rotation (int32, degrees)
+            layer.rotation = struct.unpack('<i', data[offset:offset + 4])[0]
+            offset += 4
+            
+            # Read sprite type (int32, 0 = indexed, 1 = rgba)
+            layer.sprite_type = struct.unpack('<i', data[offset:offset + 4])[0]
+            offset += 4
+        
+        # Version 2.3+ has width/height
+        if version >= ACT_VERSION_2_3:
+            layer.width = struct.unpack('<i', data[offset:offset + 4])[0]
+            offset += 4
+            layer.height = struct.unpack('<i', data[offset:offset + 4])[0]
+            offset += 4
+        
+        return layer, offset
+    
+    def _read_string(self, data: bytes, offset: int, 
+                     max_length: int) -> Tuple[str, int]:
+        """
+        Read a fixed-length null-terminated string.
+        
+        Args:
+            data: Data buffer
+            offset: Start position
+            max_length: Maximum string length
+            
+        Returns:
+            Tuple of (string, new_offset)
+        """
+        end = offset + max_length
+        
+        # Find null terminator
+        string_bytes = data[offset:end]
+        null_pos = string_bytes.find(b'\x00')
+        
+        if null_pos >= 0:
+            string_bytes = string_bytes[:null_pos]
+        
+        # Try different encodings
+        try:
+            result = string_bytes.decode('utf-8')
+        except:
+            try:
+                result = string_bytes.decode('euc-kr')
+            except:
+                result = string_bytes.decode('latin-1')
+        
+        return result, end
+
+
+# ==============================================================================
+# STANDALONE TEST
+# ==============================================================================
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1:
+        parser = ACTParser()
+        act_data = parser.load(sys.argv[1])
+        
+        if act_data:
+            print(f"ACT Version: {act_data.version}")
+            print(f"Actions: {act_data.get_action_count()}")
+            print(f"Events: {len(act_data.events)}")
+            
+            # Show first action info
+            action = act_data.get_action(0)
+            if action:
+                print(f"\nAction 0 has {action.get_frame_count()} frames")
+                
+                frame = action.get_frame(0)
+                if frame:
+                    print(f"  Frame 0 has {frame.get_layer_count()} layers")
+                    for i, layer in enumerate(frame.layers):
+                        print(f"    Layer {i}: sprite {layer.sprite_index} at ({layer.x}, {layer.y})")
+    else:
+        print("Usage: python act_parser.py <action.act>")

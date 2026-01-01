@@ -1,0 +1,43 @@
+# ==============================================================================
+# ASSET HARVESTER - PYTHON DEPENDENCIES
+# ==============================================================================
+# Install with: pip install -r requirements.txt
+# ==============================================================================
+
+# -----------------------------------------------------------------------------
+# CORE DEPENDENCIES (Required)
+# -----------------------------------------------------------------------------
+
+# SQLAlchemy - Database ORM for storing servers, assets, and metadata
+# Used for all database operations with SQLite backend
+sqlalchemy>=2.0.0
+
+# -----------------------------------------------------------------------------
+# GUI DEPENDENCIES (Optional - for desktop interface)
+# -----------------------------------------------------------------------------
+
+# PyQt6 - Modern Qt-based GUI framework
+# Used for the desktop application interface
+# Skip if only using CLI mode
+PyQt6>=6.5.0
+
+# -----------------------------------------------------------------------------
+# IMAGE PROCESSING (Optional - for thumbnails)
+# -----------------------------------------------------------------------------
+
+# Pillow - Image processing library
+# Used for generating asset thumbnails and image preview
+Pillow>=10.0.0
+
+# -----------------------------------------------------------------------------
+# DEVELOPMENT DEPENDENCIES (Optional)
+# -----------------------------------------------------------------------------
+
+# PyInstaller - For creating standalone executables
+# pyinstaller>=6.0.0
+
+# pytest - For running tests
+# pytest>=7.0.0
+
+# black - Code formatting
+# black>=23.0.0

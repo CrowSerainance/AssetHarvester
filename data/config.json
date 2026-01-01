@@ -1,0 +1,20 @@
+{
+    "asset_library_path": "",
+    "bms_scripts_path": "tools/scripts",
+    "catalog_format": "json",
+    "database_path": "data/harvester.db",
+    "debug_mode": false,
+    "default_output_path": "",
+    "extraction_threads": 4,
+    "generate_thumbnails": true,
+    "hash_algorithm": "md5",
+    "max_file_size_mb": 0,
+    "overwrite_existing": false,
+    "quickbms_path": "tools/quickbms.exe",
+    "remember_window_state": true,
+    "show_hidden_files": false,
+    "theme": "dark",
+    "thumbnail_size": 128,
+    "window_height": 900,
+    "window_width": 1400
+}
