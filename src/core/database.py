@@ -133,7 +133,7 @@ class Server(Base):
 # A client is a specific version/download of a server's game files.
 #
 # Example:
-#   client = Client(server_id=1, path="E:\\Clients\\NovaRO_2025",
+#   client = Client(server_id=1, path="C:\\Clients\\NovaRO_2025",
 #                   extracted=False)
 # ==============================================================================
 class Client(Base):
@@ -299,7 +299,7 @@ class Asset(Base):
 # and provides convenience methods for common operations.
 #
 # Usage:
-#   db = Database("E:\\2026 PROJECT\\AssetHarvester\\data\\harvester.db")
+#   db = Database("data/harvester.db")
 #   db.add_game("Ragnarok Online", ".grf", "grf_extractor")
 #   games = db.get_all_games()
 # ==============================================================================
@@ -447,7 +447,28 @@ class Database:
             return session.query(Game).filter(Game.name == name).first()
         finally:
             session.close()
-    
+
+    def get_game(self, game_id: int) -> Optional[Game]:
+        """Get a game by its ID."""
+        session = self.Session()
+        try:
+            return session.query(Game).filter(Game.id == game_id).first()
+        finally:
+            session.close()
+
+    def delete_game(self, game_id: int) -> bool:
+        """Delete a game by its ID."""
+        session = self.Session()
+        try:
+            game = session.query(Game).filter(Game.id == game_id).first()
+            if game:
+                session.delete(game)
+                session.commit()
+                return True
+            return False
+        finally:
+            session.close()
+
     # ==========================================================================
     # SERVER OPERATIONS
     # ==========================================================================
@@ -498,7 +519,20 @@ class Database:
             return session.query(Server).all()
         finally:
             session.close()
-    
+
+    def delete_server(self, server_id: int) -> bool:
+        """Delete a server by its ID."""
+        session = self.Session()
+        try:
+            server = session.query(Server).filter(Server.id == server_id).first()
+            if server:
+                session.delete(server)
+                session.commit()
+                return True
+            return False
+        finally:
+            session.close()
+
     # ==========================================================================
     # CLIENT OPERATIONS
     # ==========================================================================

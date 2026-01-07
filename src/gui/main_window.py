@@ -29,7 +29,8 @@ try:
         QFileDialog, QMessageBox, QGroupBox, QSplitter, QTreeWidget,
         QTreeWidgetItem, QStatusBar, QToolBar, QSpacerItem, QSizePolicy,
         QDialog, QFormLayout, QDialogButtonBox, QCheckBox, QSpinBox,
-        QListWidget, QListWidgetItem, QFrame
+        QListWidget, QListWidgetItem, QFrame, QGridLayout, QSlider,
+        QScrollArea, QMenu, QInputDialog
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
     from PyQt6.QtGui import QAction, QIcon, QFont, QColor
@@ -39,17 +40,22 @@ except ImportError:
     print("[ERROR] PyQt6 is not installed. Install with: pip install PyQt6")
 
 # ==============================================================================
-# CHARACTER DESIGNER IMPORT
+# GUI MODULE IMPORTS
 # ==============================================================================
-# Import the Character Designer widget for Ragnarok Online sprite preview.
-# This module provides a visual designer for Ragnarok Online character sprites,
-# allowing users to preview different job classes, equipment, and animations.
+# Import optional GUI widgets for RO-specific features
 try:
     from src.gui.character_designer import CharacterDesignerWidget
     CHARACTER_DESIGNER_AVAILABLE = True
 except ImportError:
     CHARACTER_DESIGNER_AVAILABLE = False
     print("[INFO] Character Designer module not loaded - this is optional")
+
+try:
+    from src.gui.act_spr_editor import ACTSPREditorWidget
+    ACT_SPR_EDITOR_AVAILABLE = True
+except ImportError:
+    ACT_SPR_EDITOR_AVAILABLE = False
+    print("[INFO] ACT/SPR Editor module not loaded - this is optional")
 
 
 # ==============================================================================
@@ -331,9 +337,13 @@ class ExtractWorker(QThread):
                     
                     for j, entry in enumerate(files):
                         if self._cancelled:
+                            self.log.emit("Cancelled by user")
                             return
                         
-                        if j % 1000 == 0:
+                        if j % 100 == 0:  # Check more frequently (every 100 files instead of 1000)
+                            if self._cancelled:
+                                self.log.emit("Cancelled by user")
+                                return
                             self.progress.emit(j, len(files), f"Hashing: {entry.path[:50]}...")
                         
                         # Get file data and hash it
@@ -351,12 +361,22 @@ class ExtractWorker(QThread):
             except Exception as e:
                 self.log.emit(f"  [ERROR] {e}")
         
-        self.log.emit(f"\nBaseline complete: {total_files} files hashed")
-        self.finished.emit({
-            'type': 'baseline',
-            'hashes': baseline_hashes,
-            'total': total_files
-        })
+        if self._cancelled:
+            self.log.emit("\n⚠️ Baseline scan cancelled")
+            self.finished.emit({
+                'type': 'baseline',
+                'hashes': baseline_hashes,
+                'total': total_files,
+                'cancelled': True
+            })
+        else:
+            self.log.emit(f"\nBaseline complete: {total_files} files hashed")
+            self.finished.emit({
+                'type': 'baseline',
+                'hashes': baseline_hashes,
+                'total': total_files,
+                'cancelled': False
+            })
     
     def _extract(self):
         """Extract all files from archives."""
@@ -422,15 +442,24 @@ class ExtractWorker(QThread):
                 self.log.emit(f"  [ERROR] {e}")
                 total_errors += 1
         
-        self.log.emit(f"\nExtraction complete!")
-        self.log.emit(f"  Extracted: {total_extracted}")
-        self.log.emit(f"  Errors: {total_errors}")
-        
-        self.finished.emit({
-            'type': 'extract',
-            'extracted': total_extracted,
-            'errors': total_errors
-        })
+        if self._cancelled:
+            self.log.emit(f"\n⚠️ Extraction cancelled")
+            self.finished.emit({
+                'type': 'extract',
+                'extracted': total_extracted,
+                'errors': total_errors,
+                'cancelled': True
+            })
+        else:
+            self.log.emit(f"\nExtraction complete!")
+            self.log.emit(f"  Extracted: {total_extracted}")
+            self.log.emit(f"  Errors: {total_errors}")
+            self.finished.emit({
+                'type': 'extract',
+                'extracted': total_extracted,
+                'errors': total_errors,
+                'cancelled': False
+            })
     
     def _compare(self):
         """Compare client against baseline to find custom content."""
@@ -513,22 +542,32 @@ class ExtractWorker(QThread):
             if path not in server_files:
                 results['missing'].append(path)
         
-        self.log.emit(f"\n{'='*50}")
-        self.log.emit(f"COMPARISON RESULTS:")
-        self.log.emit(f"  Identical: {len(results['identical'])}")
-        self.log.emit(f"  Modified:  {len(results['modified'])}")
-        self.log.emit(f"  New:       {len(results['new'])}")
-        self.log.emit(f"  Missing:   {len(results['missing'])}")
-        self.log.emit(f"{'='*50}")
-        
-        custom_count = len(results['modified']) + len(results['new'])
-        self.log.emit(f"\n>>> CUSTOM CONTENT: {custom_count} files <<<")
-        
-        self.finished.emit({
-            'type': 'compare',
-            'results': results,
-            'server_files': server_files
-        })
+        if self._cancelled:
+            self.log.emit(f"\n⚠️ Comparison cancelled")
+            self.finished.emit({
+                'type': 'compare',
+                'results': results,
+                'server_files': server_files,
+                'cancelled': True
+            })
+        else:
+            self.log.emit(f"\n{'='*50}")
+            self.log.emit(f"COMPARISON RESULTS:")
+            self.log.emit(f"  Identical: {len(results['identical'])}")
+            self.log.emit(f"  Modified:  {len(results['modified'])}")
+            self.log.emit(f"  New:       {len(results['new'])}")
+            self.log.emit(f"  Missing:   {len(results['missing'])}")
+            self.log.emit(f"{'='*50}")
+            
+            custom_count = len(results['modified']) + len(results['new'])
+            self.log.emit(f"\n>>> CUSTOM CONTENT: {custom_count} files <<<")
+            
+            self.finished.emit({
+                'type': 'compare',
+                'results': results,
+                'server_files': server_files,
+                'cancelled': False
+            })
     
     def _export_custom(self):
         """Export only custom/modified files."""
@@ -589,12 +628,20 @@ class ExtractWorker(QThread):
             except Exception as e:
                 self.log.emit(f"[ERROR] {e}")
         
-        self.log.emit(f"\nExported {exported} custom files to: {output}")
-        
-        self.finished.emit({
-            'type': 'export_custom',
-            'exported': exported
-        })
+        if self._cancelled:
+            self.log.emit(f"\n⚠️ Export cancelled")
+            self.finished.emit({
+                'type': 'export_custom',
+                'exported': exported,
+                'cancelled': True
+            })
+        else:
+            self.log.emit(f"\nExported {exported} custom files to: {output}")
+            self.finished.emit({
+                'type': 'export_custom',
+                'exported': exported,
+                'cancelled': False
+            })
     
     def _get_extensions(self, game_format: str) -> list:
         """Get file extensions for a format."""
@@ -770,7 +817,9 @@ class MainWindow(QMainWindow):
         self._create_extract_tab()    # Main functionality first
         self._create_servers_tab()
         self._create_results_tab()
-        self._create_character_designer_tab()  # RO Character Designer
+        self._create_grf_editor_tab()  # GRF Editor/Creator (archive management)
+        self._create_act_spr_editor_tab()  # ACT/SPR Editor (binary file editing)
+        self._create_character_designer_tab()  # Character Designer (visual preview)
         self._create_settings_tab()
     
     def _setup_statusbar(self):
@@ -1015,6 +1064,44 @@ class MainWindow(QMainWindow):
         
         self.tabs.addTab(tab, "📊 Results")
     
+    def _create_act_spr_editor_tab(self):
+        """
+        Create the ACT/SPR Editor tab for binary file editing.
+        
+        This tab provides direct editing of Ragnarok Online ACT (action) and 
+        SPR (sprite) files. It's separate from the Character Designer which 
+        focuses on visual preview/composition.
+        """
+        # Check if the ACT/SPR Editor module is available
+        if not ACT_SPR_EDITOR_AVAILABLE:
+            # Create a placeholder tab
+            tab = QWidget()
+            layout = QVBoxLayout(tab)
+            
+            info_label = QLabel(
+                "<h2>✏️ ACT/SPR Editor</h2>"
+                "<p>The ACT/SPR Editor module could not be loaded.</p>"
+                "<p>Make sure the following files exist:</p>"
+                "<ul>"
+                "<li>src/gui/act_spr_editor.py</li>"
+                "<li>src/parsers/act_parser.py</li>"
+                "<li>src/parsers/spr_parser.py</li>"
+                "</ul>"
+            )
+            info_label.setTextFormat(Qt.TextFormat.RichText)
+            info_label.setWordWrap(True)
+            info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(info_label)
+            layout.addStretch()
+            
+            self.tabs.addTab(tab, "✏️ ACT/SPR Editor")
+            return
+        
+        # Create the ACT/SPR Editor widget
+        self.act_spr_editor = ACTSPREditorWidget()
+        self.tabs.addTab(self.act_spr_editor, "✏️ ACT/SPR Editor")
+        self._log("ACT/SPR Editor loaded - Use this for binary editing of ACT/SPR files")
+    
     def _create_character_designer_tab(self):
         """
         Create the RO Character Designer tab.
@@ -1069,6 +1156,13 @@ class MainWindow(QMainWindow):
         # Connect signals for integration with main window
         self.character_designer.sprite_loaded.connect(self._on_designer_sprite_loaded)
         
+        # Connect Character Designer to main window's database and baseline
+        if self.character_designer.custom_detector:
+            self.character_designer.custom_detector.database = self.db
+            # Update baseline if we have one
+            if self.baseline:
+                self.character_designer.custom_detector.set_baseline(self.baseline)
+        
         # Add to tabs
         self.tabs.addTab(self.character_designer, "🎨 Character Designer")
         
@@ -1084,6 +1178,340 @@ class MainWindow(QMainWindow):
         """
         self._log(f"Character Designer: Loaded sprite from {path}")
     
+    def _create_grf_editor_tab(self):
+        """
+        Create the GRF Editor tab for creating and modifying GRF archives.
+
+        This tab provides comprehensive GRF archive management:
+        - Create new GRF files from scratch
+        - Add files and directories to GRF archives
+        - Remove files from GRF archives
+        - Repack existing GRF archives
+        - Preview GRF contents
+
+        This is useful for creating custom content patches or distributing
+        modified game assets in GRF format.
+        """
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Instructions
+        instructions_label = QLabel(
+            "<h3>📦 GRF Editor - Create & Modify GRF Archives</h3>"
+            "<p>Create new GRF files or modify existing ones. GRF is Ragnarok Online's archive format.</p>"
+            "<p><b>Use cases:</b> Custom content distribution, modding, repacking assets</p>"
+        )
+        instructions_label.setWordWrap(True)
+        layout.addWidget(instructions_label)
+
+        # GRF File Selection
+        file_group = QGroupBox("GRF File")
+        file_layout = QGridLayout(file_group)
+
+        file_layout.addWidget(QLabel("GRF Path:"), 0, 0)
+        self.grf_editor_path = QLineEdit()
+        self.grf_editor_path.setPlaceholderText("Path to GRF file (existing or new)...")
+        file_layout.addWidget(self.grf_editor_path, 0, 1)
+
+        browse_grf_btn = QPushButton("Browse")
+        browse_grf_btn.clicked.connect(self._browse_grf_editor_file)
+        file_layout.addWidget(browse_grf_btn, 0, 2)
+
+        create_new_btn = QPushButton("🆕 Create New GRF")
+        create_new_btn.clicked.connect(self._create_new_grf)
+        file_layout.addWidget(create_new_btn, 1, 0)
+
+        open_existing_btn = QPushButton("📂 Open Existing GRF")
+        open_existing_btn.clicked.connect(self._open_existing_grf)
+        file_layout.addWidget(open_existing_btn, 1, 1, 1, 2)
+
+        layout.addWidget(file_group)
+
+        # Splitter for file list and operations
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: Current GRF contents
+        contents_group = QGroupBox("GRF Contents")
+        contents_layout = QVBoxLayout(contents_group)
+
+        self.grf_contents_list = QListWidget()
+        contents_layout.addWidget(self.grf_contents_list)
+
+        content_buttons = QHBoxLayout()
+        refresh_btn = QPushButton("🔄 Refresh")
+        refresh_btn.clicked.connect(self._refresh_grf_contents)
+        content_buttons.addWidget(refresh_btn)
+
+        remove_file_btn = QPushButton("🗑️ Remove Selected")
+        remove_file_btn.clicked.connect(self._remove_from_grf)
+        content_buttons.addWidget(remove_file_btn)
+        content_buttons.addStretch()
+
+        contents_layout.addLayout(content_buttons)
+        splitter.addWidget(contents_group)
+
+        # Right: Add files panel
+        add_group = QGroupBox("Add to GRF")
+        add_layout = QVBoxLayout(add_group)
+
+        # Add single file
+        add_file_group = QGroupBox("Add Single File")
+        add_file_layout = QGridLayout(add_file_group)
+
+        add_file_layout.addWidget(QLabel("Local File:"), 0, 0)
+        self.add_local_file_path = QLineEdit()
+        add_file_layout.addWidget(self.add_local_file_path, 0, 1)
+
+        browse_local_btn = QPushButton("Browse")
+        browse_local_btn.clicked.connect(self._browse_local_file)
+        add_file_layout.addWidget(browse_local_btn, 0, 2)
+
+        add_file_layout.addWidget(QLabel("GRF Path:"), 1, 0)
+        self.add_grf_path = QLineEdit()
+        self.add_grf_path.setPlaceholderText("data\\sprite\\custom.spr")
+        add_file_layout.addWidget(self.add_grf_path, 1, 1, 1, 2)
+
+        add_single_btn = QPushButton("➕ Add File")
+        add_single_btn.clicked.connect(self._add_single_file_to_grf)
+        add_file_layout.addWidget(add_single_btn, 2, 0, 1, 3)
+
+        add_layout.addWidget(add_file_group)
+
+        # Add directory
+        add_dir_group = QGroupBox("Add Directory")
+        add_dir_layout = QGridLayout(add_dir_group)
+
+        add_dir_layout.addWidget(QLabel("Local Directory:"), 0, 0)
+        self.add_local_dir_path = QLineEdit()
+        add_dir_layout.addWidget(self.add_local_dir_path, 0, 1)
+
+        browse_dir_btn = QPushButton("Browse")
+        browse_dir_btn.clicked.connect(self._browse_local_directory)
+        add_dir_layout.addWidget(browse_dir_btn, 0, 2)
+
+        add_dir_layout.addWidget(QLabel("GRF Base Path:"), 1, 0)
+        self.add_grf_base_path = QLineEdit()
+        self.add_grf_base_path.setPlaceholderText("data\\sprite")
+        add_dir_layout.addWidget(self.add_grf_base_path, 1, 1, 1, 2)
+
+        recursive_check = QCheckBox("Include subdirectories")
+        recursive_check.setChecked(True)
+        add_dir_layout.addWidget(recursive_check, 2, 0, 1, 3)
+        self.grf_recursive_check = recursive_check
+
+        add_dir_btn = QPushButton("📁 Add Directory")
+        add_dir_btn.clicked.connect(self._add_directory_to_grf)
+        add_dir_layout.addWidget(add_dir_btn, 3, 0, 1, 3)
+
+        add_layout.addWidget(add_dir_group)
+        add_layout.addStretch()
+
+        splitter.addWidget(add_group)
+        layout.addWidget(splitter)
+
+        # Save and close buttons
+        action_buttons = QHBoxLayout()
+
+        save_grf_btn = QPushButton("💾 Save GRF")
+        save_grf_btn.clicked.connect(self._save_grf)
+        action_buttons.addWidget(save_grf_btn)
+
+        save_as_btn = QPushButton("💾 Save GRF As...")
+        save_as_btn.clicked.connect(self._save_grf_as)
+        action_buttons.addWidget(save_as_btn)
+
+        close_grf_btn = QPushButton("❌ Close GRF")
+        close_grf_btn.clicked.connect(self._close_grf_editor)
+        action_buttons.addWidget(close_grf_btn)
+
+        action_buttons.addStretch()
+        layout.addLayout(action_buttons)
+
+        # Status
+        self.grf_editor_status = QLabel("No GRF file open")
+        self.grf_editor_status.setStyleSheet("color: #888; font-style: italic;")
+        layout.addWidget(self.grf_editor_status)
+
+        self.tabs.addTab(tab, "📦 GRF Editor")
+
+        # Store GRF editor instance
+        self.grf_editor = None
+
+    def _browse_grf_editor_file(self):
+        """Browse for GRF file."""
+        path, _ = QFileDialog.getSaveFileName(self, "Select GRF File", "", "GRF Files (*.grf)")
+        if path:
+            self.grf_editor_path.setText(path)
+
+    def _create_new_grf(self):
+        """Create a new empty GRF file."""
+        from src.extractors.grf_editor import GRFEditor
+
+        path = self.grf_editor_path.text().strip()
+        if not path:
+            QMessageBox.warning(self, "Error", "Enter a GRF file path first")
+            return
+
+        self.grf_editor = GRFEditor()
+        if self.grf_editor.create(path):
+            self.grf_editor_status.setText(f"New GRF created: {os.path.basename(path)}")
+            self.grf_editor_status.setStyleSheet("color: #4caf50; font-weight: bold;")
+            self._refresh_grf_contents()
+            self._log(f"Created new GRF: {path}")
+        else:
+            QMessageBox.critical(self, "Error", "Failed to create GRF")
+
+    def _open_existing_grf(self):
+        """Open an existing GRF file for editing."""
+        from src.extractors.grf_editor import GRFEditor
+
+        path = self.grf_editor_path.text().strip()
+        if not path:
+            QMessageBox.warning(self, "Error", "Enter a GRF file path first")
+            return
+
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Error", f"GRF file not found: {path}")
+            return
+
+        self.grf_editor = GRFEditor()
+        if self.grf_editor.open(path):
+            self.grf_editor_status.setText(f"Opened: {os.path.basename(path)} ({len(self.grf_editor.files)} files)")
+            self.grf_editor_status.setStyleSheet("color: #4caf50; font-weight: bold;")
+            self._refresh_grf_contents()
+            self._log(f"Opened GRF: {path}")
+        else:
+            QMessageBox.critical(self, "Error", "Failed to open GRF")
+
+    def _refresh_grf_contents(self):
+        """Refresh the GRF contents list."""
+        self.grf_contents_list.clear()
+
+        if not self.grf_editor:
+            return
+
+        files = self.grf_editor.list_files()
+        for file_path in sorted(files):
+            self.grf_contents_list.addItem(file_path)
+
+        self.grf_editor_status.setText(f"{len(files)} files in GRF")
+
+    def _browse_local_file(self):
+        """Browse for local file to add."""
+        path, _ = QFileDialog.getOpenFileName(self, "Select File to Add")
+        if path:
+            self.add_local_file_path.setText(path)
+
+    def _browse_local_directory(self):
+        """Browse for local directory to add."""
+        path = QFileDialog.getExistingDirectory(self, "Select Directory to Add")
+        if path:
+            self.add_local_dir_path.setText(path)
+
+    def _add_single_file_to_grf(self):
+        """Add a single file to the GRF."""
+        if not self.grf_editor:
+            QMessageBox.warning(self, "Error", "Create or open a GRF first")
+            return
+
+        local_path = self.add_local_file_path.text().strip()
+        grf_path = self.add_grf_path.text().strip()
+
+        if not local_path or not grf_path:
+            QMessageBox.warning(self, "Error", "Enter both local and GRF paths")
+            return
+
+        if self.grf_editor.add_file(local_path, grf_path):
+            self._refresh_grf_contents()
+            self.grf_editor_status.setText("File added (not saved)")
+            self.grf_editor_status.setStyleSheet("color: #ff9800; font-weight: bold;")
+            self._log(f"Added: {grf_path}")
+        else:
+            QMessageBox.critical(self, "Error", "Failed to add file")
+
+    def _add_directory_to_grf(self):
+        """Add an entire directory to the GRF."""
+        if not self.grf_editor:
+            QMessageBox.warning(self, "Error", "Create or open a GRF first")
+            return
+
+        local_dir = self.add_local_dir_path.text().strip()
+        grf_base = self.add_grf_base_path.text().strip()
+
+        if not local_dir or not grf_base:
+            QMessageBox.warning(self, "Error", "Enter both local directory and GRF base path")
+            return
+
+        recursive = self.grf_recursive_check.isChecked()
+        count = self.grf_editor.add_directory(local_dir, grf_base, recursive=recursive)
+
+        if count > 0:
+            self._refresh_grf_contents()
+            self.grf_editor_status.setText(f"Added {count} files (not saved)")
+            self.grf_editor_status.setStyleSheet("color: #ff9800; font-weight: bold;")
+            self._log(f"Added directory: {count} files")
+        else:
+            QMessageBox.warning(self, "Warning", "No files were added")
+
+    def _remove_from_grf(self):
+        """Remove selected file from GRF."""
+        if not self.grf_editor:
+            return
+
+        selected = self.grf_contents_list.currentItem()
+        if not selected:
+            QMessageBox.warning(self, "Error", "Select a file to remove")
+            return
+
+        file_path = selected.text()
+
+        if self.grf_editor.remove_file(file_path):
+            self._refresh_grf_contents()
+            self.grf_editor_status.setText("File removed (not saved)")
+            self.grf_editor_status.setStyleSheet("color: #ff9800; font-weight: bold;")
+            self._log(f"Removed: {file_path}")
+
+    def _save_grf(self):
+        """Save the GRF to disk."""
+        if not self.grf_editor:
+            QMessageBox.warning(self, "Error", "No GRF file open")
+            return
+
+        self._log("Saving GRF...")
+        if self.grf_editor.save():
+            self.grf_editor_status.setText("GRF saved successfully")
+            self.grf_editor_status.setStyleSheet("color: #4caf50; font-weight: bold;")
+            QMessageBox.information(self, "Success", "GRF saved successfully")
+        else:
+            QMessageBox.critical(self, "Error", "Failed to save GRF")
+
+    def _save_grf_as(self):
+        """Save the GRF to a new location."""
+        if not self.grf_editor:
+            QMessageBox.warning(self, "Error", "No GRF file open")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "Save GRF As", "", "GRF Files (*.grf)")
+        if path:
+            if self.grf_editor.save(path):
+                self.grf_editor_path.setText(path)
+                self.grf_editor_status.setText(f"GRF saved: {os.path.basename(path)}")
+                self.grf_editor_status.setStyleSheet("color: #4caf50; font-weight: bold;")
+                self._log(f"Saved GRF as: {path}")
+                QMessageBox.information(self, "Success", "GRF saved successfully")
+            else:
+                QMessageBox.critical(self, "Error", "Failed to save GRF")
+
+    def _close_grf_editor(self):
+        """Close the current GRF file."""
+        if self.grf_editor:
+            self.grf_editor.close()
+            self.grf_editor = None
+            self.grf_contents_list.clear()
+            self.grf_editor_status.setText("GRF closed")
+            self.grf_editor_status.setStyleSheet("color: #888; font-style: italic;")
+            self._log("GRF editor closed")
+
     def _create_settings_tab(self):
         """Create Settings tab."""
         tab = QWidget()
@@ -1094,7 +1522,7 @@ class MainWindow(QMainWindow):
         paths_layout = QFormLayout(paths_group)
         
         self.default_output = QLineEdit()
-        self.default_output.setPlaceholderText("E:\\MMORPG\\ASSET_LIBRARY")
+        self.default_output.setPlaceholderText("C:\\Extracted\\Assets")
         paths_layout.addRow("Default Output:", self.default_output)
         
         layout.addWidget(paths_group)
@@ -1160,22 +1588,27 @@ class MainWindow(QMainWindow):
         """Load servers list."""
         self.servers_table.setRowCount(0)
         self.servers = []
-        
+
         if self.db:
             try:
                 db_servers = self.db.get_all_servers()
                 for s in db_servers:
                     game = self.db.get_game(s.game_id)
+                    # Get client path from latest client if exists
+                    client_path = ""
+                    if s.clients:
+                        client_path = s.clients[-1].path or ""
                     self.servers.append({
                         'id': s.id,
                         'name': s.name,
                         'game': game.name if game else "Unknown",
-                        'path': s.client_path or "",
+                        'game_id': s.game_id,
+                        'path': client_path,
                         'website': s.website or ""
                     })
             except:
                 pass
-        
+
         self.servers_table.setRowCount(len(self.servers))
         for i, s in enumerate(self.servers):
             self.servers_table.setItem(i, 0, QTableWidgetItem(s['name']))
@@ -1238,50 +1671,69 @@ class MainWindow(QMainWindow):
         if not self.games:
             QMessageBox.warning(self, "Error", "Add a game first!")
             return
-        
+
         game_list = [(g[0], g[1]) for g in self.games]
         dialog = AddServerDialog(self, game_list)
-        
+
         if dialog.exec() == QDialog.DialogCode.Accepted:
             data = dialog.get_data()
-            if data['name'] and data['client_path']:
+            if data['name']:
                 # Add to database
                 if self.db:
                     try:
-                        self.db.add_server(
+                        server = self.db.add_server(
                             name=data['name'],
                             game_id=data['game_id'],
-                            client_path=data['client_path'],
-                            website=data['website']
+                            website=data.get('website', '')
                         )
+                        # If client path provided, create a client entry
+                        if data.get('client_path'):
+                            self.db.add_client(server.id, data['client_path'])
                     except:
                         pass
-                
+
                 self._load_servers()
                 self._log(f"Added server: {data['name']}")
-                
+
                 # Auto-fill the server path
-                self.server_path.setText(data['client_path'])
+                if data.get('client_path'):
+                    self.server_path.setText(data['client_path'])
     
     def _on_remove_game(self):
         """Remove selected game."""
         row = self.games_table.currentRow()
-        if row >= 0:
-            name = self.games_table.item(row, 0).text()
+        if row >= 0 and row < len(self.games):
+            gid, name, _, _ = self.games[row]
             reply = QMessageBox.question(self, "Confirm", f"Remove game '{name}'?")
             if reply == QMessageBox.StandardButton.Yes:
-                self._log(f"Removed game: {name}")
+                # Delete from database
+                if self.db:
+                    try:
+                        self.db.delete_game(gid)
+                    except:
+                        pass
+                # Remove from local list
+                del self.games[row]
                 self._load_games()
+                self._log(f"Removed game: {name}")
     
     def _on_remove_server(self):
         """Remove selected server."""
         row = self.servers_table.currentRow()
-        if row >= 0:
-            name = self.servers_table.item(row, 0).text()
-            reply = QMessageBox.question(self, "Confirm", f"Remove server '{name}'?")
+        if row >= 0 and row < len(self.servers):
+            server = self.servers[row]
+            reply = QMessageBox.question(self, "Confirm", f"Remove server '{server['name']}'?")
             if reply == QMessageBox.StandardButton.Yes:
-                self._log(f"Removed server: {name}")
+                # Delete from database
+                if self.db:
+                    try:
+                        self.db.delete_server(server['id'])
+                    except:
+                        pass
+                # Remove from local list
+                del self.servers[row]
                 self._load_servers()
+                self._log(f"Removed server: {server['name']}")
     
     def _on_scan_baseline(self):
         """Scan vanilla baseline."""
@@ -1389,9 +1841,12 @@ class MainWindow(QMainWindow):
     
     def _on_cancel(self):
         """Cancel current operation."""
-        if self.worker:
+        if self.worker and self.worker.isRunning():
             self.worker.cancel()
-            self._log("Cancelling...")
+            self._log("Cancelling operation...")
+            # Don't reset UI immediately - let worker finish and handle cleanup
+        else:
+            self._log("No operation to cancel")
     
     # ==========================================================================
     # WORKER MANAGEMENT
@@ -1431,6 +1886,12 @@ class MainWindow(QMainWindow):
     
     def _on_worker_finished(self, result: dict):
         """Handle worker completion."""
+        # Check if operation was cancelled
+        if result and result.get('cancelled', False):
+            self._log("\n⚠️ Operation cancelled by user")
+            self._set_busy(False)
+            return
+        
         self._set_busy(False)
         
         result_type = result.get('type')
@@ -1446,6 +1907,13 @@ class MainWindow(QMainWindow):
             row = self.game_combo.currentIndex()
             if row >= 0:
                 self.games_table.setItem(row, 3, QTableWidgetItem(f"✅ {count} files"))
+            
+            # Update Character Designer with new baseline
+            if self.character_designer and self.character_designer.custom_detector:
+                # Convert baseline format: {path: {hash, size, archive}} -> {path: hash}
+                baseline_hashes = {path: data.get('hash', '') for path, data in self.baseline.items()}
+                self.character_designer.custom_detector.set_baseline(baseline_hashes)
+                self._log("Character Designer: Baseline updated")
         
         elif result_type == 'compare':
             self.comparison = result

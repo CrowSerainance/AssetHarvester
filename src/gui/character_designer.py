@@ -1,13 +1,17 @@
 # ==============================================================================
-# CHARACTER DESIGNER MODULE - ENHANCED VERSION
+# CHARACTER DESIGNER MODULE
 # ==============================================================================
-# A comprehensive visual character designer for Ragnarok Online sprites.
+# Visual character designer for Ragnarok Online sprites.
+#
+# This module focuses on VISUAL PREVIEW and COMPOSITION of character sprites.
+# It is separate from the ACT/SPR Editor which handles binary file editing.
 #
 # FEATURES:
-#   1. Side-by-side comparison view (vanilla vs custom)
-#   2. Auto-detect custom sprites (database integration)
-#   3. Batch export (all headgear/jobs as sprite sheets)
-#   4. Item database lookup (headgear names)
+#   1. Visual sprite composition and preview
+#   2. Side-by-side comparison view (vanilla vs custom)
+#   3. Auto-detect custom sprites (database integration)
+#   4. Batch export (all headgear/jobs as sprite sheets)
+#   5. Item database lookup (headgear names)
 #
 # The designer works with extracted RO data files. Point it to a folder
 # containing the extracted 'data/sprite' directory structure from GRF files.
@@ -35,7 +39,7 @@ try:
         QListWidgetItem, QMessageBox, QProgressDialog,
         QDialog, QDialogButtonBox, QTextEdit, QTableWidget,
         QTableWidgetItem, QHeaderView, QAbstractItemView,
-        QMenu, QInputDialog
+        QMenu, QInputDialog, QTreeWidget, QTreeWidgetItem
     )
     from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QThread
     from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QAction
@@ -164,9 +168,35 @@ class SpriteCompositor:
         self.body_palette = -1
     
     def set_resource_path(self, path: str):
-        """Set the resource path and clear cache."""
+        """
+        Set the resource path and clear cache.
+        
+        Auto-detects if user selected the 'data' folder instead of parent.
+        The path should be the folder CONTAINING 'data/sprite/', not 'data' itself.
+        """
+        # Normalize path
+        path = os.path.normpath(path)
+        
+        # Auto-detect: if user selected 'data' folder, go up one level
+        # Check if path ends with 'data' and contains 'sprite' subfolder
+        if os.path.basename(path).lower() == 'data':
+            sprite_check = os.path.join(path, 'sprite')
+            if os.path.isdir(sprite_check):
+                # User selected 'data' folder - go up one level
+                path = os.path.dirname(path)
+                print(f"[INFO] Auto-corrected path to parent: {path}")
+        
+        # Also check if data/sprite exists at expected location
+        expected_sprite = os.path.join(path, 'data', 'sprite')
+        if not os.path.isdir(expected_sprite):
+            # Try alternative: maybe sprites are directly in path/sprite
+            alt_sprite = os.path.join(path, 'sprite')
+            if os.path.isdir(alt_sprite):
+                print(f"[INFO] Found sprites at {alt_sprite} - adjusting paths")
+        
         self.resource_path = path
         self.cache.clear()
+        print(f"[INFO] Resource path set to: {path}")
     
     def get_sprite_path(self, sprite_type: str, sprite_id: int = 0) -> str:
         """
@@ -199,28 +229,59 @@ class SpriteCompositor:
         return ""
     
     def load_sprite(self, relative_path: str) -> Optional[Tuple[SPRSprite, ACTData]]:
-        """Load a sprite and its action file."""
+        """
+        Load a sprite and its action file.
+        
+        Args:
+            relative_path: Path relative to resource folder (without extension)
+                          Example: "data/sprite/인간족/몸통/남/초보자_남"
+        
+        Returns:
+            Tuple of (SPRSprite, ACTData) or None if not found
+        """
         if not self.spr_parser or not self.act_parser:
+            print("[ERROR] Parsers not available")
             return None
         
+        # Check cache first
         if relative_path in self.cache:
             return self.cache[relative_path]
         
+        # Build full paths
         base_path = os.path.join(self.resource_path, relative_path)
         spr_path = base_path + ".spr"
         act_path = base_path + ".act"
         
+        # Debug: show what we're looking for
         if not os.path.exists(spr_path):
-            return None
-        if not os.path.exists(act_path):
+            print(f"[DEBUG] SPR not found: {spr_path}")
+            # Try to help diagnose the issue
+            parent_dir = os.path.dirname(base_path)
+            if os.path.isdir(parent_dir):
+                print(f"[DEBUG] Parent folder exists: {parent_dir}")
+                try:
+                    files = os.listdir(parent_dir)[:5]  # Show first 5 files
+                    print(f"[DEBUG] Sample files in folder: {files}")
+                except:
+                    pass
+            else:
+                print(f"[DEBUG] Parent folder NOT found: {parent_dir}")
             return None
         
+        if not os.path.exists(act_path):
+            print(f"[DEBUG] ACT not found: {act_path}")
+            return None
+        
+        # Load the files
         sprite = self.spr_parser.load(spr_path)
         action = self.act_parser.load(act_path)
         
         if sprite and action:
             self.cache[relative_path] = (sprite, action)
+            print(f"[DEBUG] Loaded: {relative_path}")
             return (sprite, action)
+        else:
+            print(f"[DEBUG] Failed to parse: {relative_path}")
         
         return None
     
@@ -375,10 +436,18 @@ class BatchExportWorker(QThread):
         self.exporter = exporter
         self.operation = operation
         self.kwargs = kwargs
+        self._cancelled = False
+    
+    def cancel(self):
+        """Request cancellation."""
+        self._cancelled = True
     
     def run(self):
         try:
             result = None
+            
+            if self._cancelled:
+                return
             
             if self.operation == "headgear":
                 result = self.exporter.export_all_headgear(
@@ -419,12 +488,17 @@ class BatchExportWorker(QThread):
                     self._progress
                 )
             
-            self.finished.emit(result)
+            if not self._cancelled:
+                self.finished.emit(result)
             
         except Exception as e:
-            self.error.emit(str(e))
+            if not self._cancelled:
+                self.error.emit(str(e))
     
     def _progress(self, current, total, message):
+        """Progress callback - checks for cancellation."""
+        if self._cancelled:
+            return  # Stop processing if cancelled
         self.progress.emit(current, total, message)
 
 
@@ -853,11 +927,17 @@ class BatchExportDialog(QDialog):
 
 class CharacterDesignerWidget(QWidget):
     """
-    Enhanced Character Designer with all four features:
-    1. Side-by-side comparison view
-    2. Auto-detect custom sprites
-    3. Batch export
-    4. Item database lookup
+    Visual Character Designer for Ragnarok Online sprites.
+    
+    Focuses on visual preview, composition, and comparison of character sprites.
+    For binary editing of ACT/SPR files, use the separate ACT/SPR Editor tab.
+    
+    Features:
+    1. Visual sprite composition and preview
+    2. Side-by-side comparison view (vanilla vs custom)
+    3. Auto-detect custom sprites (database integration)
+    4. Batch export (all headgear/jobs as sprite sheets)
+    5. Item database lookup (headgear names)
     """
     
     sprite_loaded = pyqtSignal(str)
@@ -869,15 +949,18 @@ class CharacterDesignerWidget(QWidget):
         # Initialize components
         self.compositor = SpriteCompositor()
         self.item_db = get_item_database() if PARSERS_AVAILABLE else None
+        # CustomSpriteDetector will be connected to database/baseline by parent MainWindow
         self.custom_detector = CustomSpriteDetector()
         self.sprite_catalog = None
-        
+
+        # Note: ACT/SPR Editor has been moved to a standalone top-level tab
+
         # Animation state
         self.animation_timer = QTimer()
         self.animation_timer.timeout.connect(self._on_animation_tick)
         self.current_frame = 0
         self.is_animating = False
-        
+
         # Batch export
         self.batch_worker = None
         
@@ -910,17 +993,20 @@ class CharacterDesignerWidget(QWidget):
         browser_tab = QWidget()
         self._setup_browser_tab(browser_tab)
         self.view_tabs.addTab(browser_tab, "🔍 Item Browser")
-        
+
+        # Note: ACT/SPR Editor has been moved to a standalone top-level tab
+
         main_layout.addWidget(self.view_tabs)
     
     def _setup_designer_tab(self, tab: QWidget):
         """Setup the main designer tab."""
         main_layout = QHBoxLayout(tab)
-        
+
         # === LEFT PANEL: Controls ===
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_panel.setMaximumWidth(350)
+        left_panel.setMinimumWidth(320)
+        left_panel.setMaximumWidth(400)
         
         # Resource Path
         path_group = QGroupBox("Resource Path")
@@ -939,104 +1025,120 @@ class CharacterDesignerWidget(QWidget):
         # Character Settings
         char_group = QGroupBox("Character")
         char_layout = QGridLayout(char_group)
-        
+        char_layout.setColumnStretch(1, 1)  # Make input column expand
+
         char_layout.addWidget(QLabel("Job:"), 0, 0)
         self.job_combo = QComboBox()
         self.job_combo.addItems(sorted(JOB_DATA.keys()))
         self.job_combo.setCurrentText("Novice")
+        self.job_combo.setMinimumWidth(120)
         char_layout.addWidget(self.job_combo, 0, 1)
-        
+
         char_layout.addWidget(QLabel("Gender:"), 1, 0)
         self.gender_combo = QComboBox()
         self.gender_combo.addItems(["Male", "Female"])
+        self.gender_combo.setMinimumWidth(120)
         char_layout.addWidget(self.gender_combo, 1, 1)
-        
+
         char_layout.addWidget(QLabel("Head:"), 2, 0)
         self.head_spin = QSpinBox()
         self.head_spin.setRange(1, 30)
         self.head_spin.setValue(1)
+        self.head_spin.setMinimumWidth(80)
         char_layout.addWidget(self.head_spin, 2, 1)
-        
+
         char_layout.addWidget(QLabel("Hair Color:"), 3, 0)
         self.hair_spin = QSpinBox()
         self.hair_spin.setRange(0, 8)
         self.hair_spin.setValue(0)
+        self.hair_spin.setMinimumWidth(80)
         char_layout.addWidget(self.hair_spin, 3, 1)
-        
+
         left_layout.addWidget(char_group)
         
         # Equipment (with item names!)
         equip_group = QGroupBox("Equipment")
         equip_layout = QGridLayout(equip_group)
-        
+        equip_layout.setColumnStretch(1, 1)  # Make SpinBox column expand
+        equip_layout.setColumnStretch(2, 2)  # Item name column gets more space
+
         # Headgear Top
         equip_layout.addWidget(QLabel("Headgear Top:"), 0, 0)
         self.hg_top_spin = QSpinBox()
         self.hg_top_spin.setRange(0, 99999)
         self.hg_top_spin.setSpecialValueText("None")
+        self.hg_top_spin.setMinimumWidth(70)
         self.hg_top_spin.valueChanged.connect(self._update_hg_name)
         equip_layout.addWidget(self.hg_top_spin, 0, 1)
         self.hg_top_name = QLabel("")
         self.hg_top_name.setStyleSheet("color: #888; font-style: italic;")
         equip_layout.addWidget(self.hg_top_name, 0, 2)
-        
+
         # Headgear Mid
         equip_layout.addWidget(QLabel("Headgear Mid:"), 1, 0)
         self.hg_mid_spin = QSpinBox()
         self.hg_mid_spin.setRange(0, 99999)
         self.hg_mid_spin.setSpecialValueText("None")
+        self.hg_mid_spin.setMinimumWidth(70)
         self.hg_mid_spin.valueChanged.connect(self._update_hg_name)
         equip_layout.addWidget(self.hg_mid_spin, 1, 1)
         self.hg_mid_name = QLabel("")
         self.hg_mid_name.setStyleSheet("color: #888; font-style: italic;")
         equip_layout.addWidget(self.hg_mid_name, 1, 2)
-        
+
         # Headgear Low
         equip_layout.addWidget(QLabel("Headgear Low:"), 2, 0)
         self.hg_low_spin = QSpinBox()
         self.hg_low_spin.setRange(0, 99999)
         self.hg_low_spin.setSpecialValueText("None")
+        self.hg_low_spin.setMinimumWidth(70)
         self.hg_low_spin.valueChanged.connect(self._update_hg_name)
         equip_layout.addWidget(self.hg_low_spin, 2, 1)
         self.hg_low_name = QLabel("")
         self.hg_low_name.setStyleSheet("color: #888; font-style: italic;")
         equip_layout.addWidget(self.hg_low_name, 2, 2)
-        
+
         # Weapon
         equip_layout.addWidget(QLabel("Weapon:"), 3, 0)
         self.weapon_spin = QSpinBox()
         self.weapon_spin.setRange(0, 999)
         self.weapon_spin.setSpecialValueText("None")
+        self.weapon_spin.setMinimumWidth(70)
         equip_layout.addWidget(self.weapon_spin, 3, 1)
-        
+
         # Shield
         equip_layout.addWidget(QLabel("Shield:"), 4, 0)
         self.shield_spin = QSpinBox()
         self.shield_spin.setRange(0, 999)
         self.shield_spin.setSpecialValueText("None")
+        self.shield_spin.setMinimumWidth(70)
         equip_layout.addWidget(self.shield_spin, 4, 1)
-        
+
         left_layout.addWidget(equip_group)
         
         # Animation Controls
         anim_group = QGroupBox("Animation")
         anim_layout = QGridLayout(anim_group)
-        
+        anim_layout.setColumnStretch(1, 1)  # Make input column expand
+
         anim_layout.addWidget(QLabel("Action:"), 0, 0)
         self.action_combo = QComboBox()
         for idx, name in sorted(ACTION_NAMES.items()):
             self.action_combo.addItem(name, idx)
+        self.action_combo.setMinimumWidth(120)
         anim_layout.addWidget(self.action_combo, 0, 1)
-        
+
         anim_layout.addWidget(QLabel("Direction:"), 1, 0)
         self.direction_combo = QComboBox()
         for i, name in enumerate(DIRECTION_NAMES):
             self.direction_combo.addItem(f"{i}: {name}", i)
+        self.direction_combo.setMinimumWidth(120)
         anim_layout.addWidget(self.direction_combo, 1, 1)
-        
+
         anim_layout.addWidget(QLabel("Frame:"), 2, 0)
         self.frame_spin = QSpinBox()
         self.frame_spin.setRange(0, 99)
+        self.frame_spin.setMinimumWidth(80)
         anim_layout.addWidget(self.frame_spin, 2, 1)
         
         anim_btn_layout = QHBoxLayout()
@@ -1221,6 +1323,7 @@ class CharacterDesignerWidget(QWidget):
         # Load default items
         self._populate_item_table()
     
+
     def _connect_signals(self):
         """Connect UI signals."""
         self.job_combo.currentTextChanged.connect(self._on_character_changed)
@@ -1327,8 +1430,26 @@ class CharacterDesignerWidget(QWidget):
             self, "Select Extracted RO Data Folder"
         )
         if path:
+            # Auto-correct if user selected 'data' folder
+            if os.path.basename(path).lower() == 'data':
+                sprite_check = os.path.join(path, 'sprite')
+                if os.path.isdir(sprite_check):
+                    # Go up one level
+                    path = os.path.dirname(path)
+                    QMessageBox.information(self, "Path Corrected",
+                        f"Auto-corrected path to:\n{path}\n\n"
+                        "(You selected the 'data' folder - the path should be the parent folder)")
+            
             self.path_edit.setText(path)
             self.compositor.set_resource_path(path)
+            
+            # Verify the path structure
+            sprite_path = os.path.join(path, 'data', 'sprite')
+            if not os.path.isdir(sprite_path):
+                QMessageBox.warning(self, "Path Warning",
+                    f"Expected folder not found:\n{sprite_path}\n\n"
+                    "Make sure you selected the folder that CONTAINS the 'data' folder.")
+            
             self._on_render()
     
     def _on_character_changed(self):
@@ -1420,13 +1541,14 @@ class CharacterDesignerWidget(QWidget):
         """Display a PIL Image in the preview label."""
         if not PIL_AVAILABLE:
             return
-        
+
         zoom = self.zoom_slider.value() / 100.0
         new_size = (int(img.width * zoom), int(img.height * zoom))
         display_img = img.resize(new_size, Image.Resampling.NEAREST)
-        
-        qim = ImageQt(display_img)
-        pixmap = QPixmap.fromImage(qim)
+
+        # Keep reference to prevent garbage collection before pixmap is displayed
+        self._current_qimage = ImageQt(display_img)
+        pixmap = QPixmap.fromImage(self._current_qimage)
         self.preview_label.setPixmap(pixmap)
     
     def _on_zoom_changed(self):
@@ -1604,6 +1726,7 @@ class CharacterDesignerWidget(QWidget):
         # Show progress
         self.batch_progress_bar.setVisible(True)
         self.batch_progress_bar.setValue(0)
+        self.batch_cancel_btn.setVisible(True)
         self.batch_log.clear()
         self.batch_log.append(f"Starting {export_type} export...")
         
@@ -1621,9 +1744,16 @@ class CharacterDesignerWidget(QWidget):
             self.batch_progress_bar.setValue(current)
         self.batch_progress_label.setText(message)
     
+    def _on_batch_cancel(self):
+        """Cancel batch export."""
+        if self.batch_worker and self.batch_worker.isRunning():
+            self.batch_worker.cancel()
+            self.batch_log.append("\n⚠️ Cancelling export...")
+    
     def _on_batch_finished(self, result: ExportResult):
         """Handle batch export completion."""
         self.batch_progress_bar.setVisible(False)
+        self.batch_cancel_btn.setVisible(False)
         
         if result and result.success:
             self.batch_log.append(f"\n✅ Export complete!")
@@ -1646,6 +1776,7 @@ class CharacterDesignerWidget(QWidget):
     def _on_batch_error(self, error: str):
         """Handle batch export error."""
         self.batch_progress_bar.setVisible(False)
+        self.batch_cancel_btn.setVisible(False)
         self.batch_log.append(f"\n❌ Error: {error}")
         self.batch_progress_label.setText("Export failed")
         QMessageBox.critical(self, "Error", f"Export failed:\n{error}")

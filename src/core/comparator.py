@@ -9,15 +9,21 @@
 #   - "new":       Path doesn't exist in vanilla at all (custom content!)
 #   - "unknown":   Not yet compared or comparison failed
 #
+# Performance optimizations:
+#   - Parallel file hashing using ThreadPoolExecutor
+#   - Batch database operations
+#   - Memory-efficient baseline cache
+#
 # Usage:
 #   comparator = AssetComparator(database, game_id=1)
-#   comparator.build_baseline("E:\\vanilla_client")
-#   results = comparator.compare_client("E:\\server_client")
+#   comparator.build_baseline("C:\\Games\\RO_Vanilla")
+#   results = comparator.compare_client("C:\\Games\\ServerClient")
 # ==============================================================================
 
 import os
 from typing import List, Dict, Optional, Callable
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .hasher import FileHasher
 from .database import Database
 
@@ -50,41 +56,47 @@ class ComparisonResult:
 class AssetComparator:
     """
     Compares extracted assets against vanilla baselines.
-    
+
     This class is the core of custom content detection. It builds a "fingerprint"
     database of all files in a vanilla/original game client, then compares
     private server clients against this baseline to identify modifications
     and new custom content.
-    
+
     The comparison process:
     1. Build baseline from vanilla client (one-time per game)
     2. Extract/scan private server client
     3. Compare each file's hash against baseline
     4. Mark files as identical, modified, or new
-    
+
     Attributes:
         db (Database):      Database instance for storing baselines
         game_id (int):      ID of the game being compared
         hasher (FileHasher): File hashing utility
         baseline_cache (dict): In-memory cache of vanilla hashes
+        workers (int):      Number of parallel workers for hashing
     """
-    
-    def __init__(self, db: Database, game_id: int):
+
+    # Default number of parallel workers
+    DEFAULT_WORKERS = 4
+
+    def __init__(self, db: Database, game_id: int, workers: int = DEFAULT_WORKERS):
         """
         Initialize the comparator.
-        
+
         Args:
             db: Database instance for storing/retrieving baselines
             game_id: ID of the game being compared
+            workers: Number of parallel workers for file operations
         """
         self.db = db
         self.game_id = game_id
-        self.hasher = FileHasher()
-        
+        self.workers = workers
+        self.hasher = FileHasher(workers=workers)
+
         # In-memory cache of vanilla file hashes for faster comparison
         # Structure: {"relative/path": "md5hash"}
         self.baseline_cache: Dict[str, str] = {}
-        
+
         # Load existing baseline into cache
         self._load_baseline_cache()
     
@@ -111,85 +123,112 @@ class AssetComparator:
     # BASELINE BUILDING
     # ==========================================================================
     
-    def build_baseline(self, vanilla_path: str, 
+    def build_baseline(self, vanilla_path: str,
                        progress_callback: Callable[[int, int, str], None] = None,
-                       file_extensions: List[str] = None) -> int:
+                       file_extensions: List[str] = None,
+                       batch_size: int = 100) -> int:
         """
         Build the vanilla baseline from an original game client.
-        
+
         This scans all files in the vanilla client directory, computes their
-        hashes, and stores them in the database. This only needs to be done
-        once per game (unless the vanilla version changes).
-        
+        hashes in parallel, and stores them in the database. This only needs
+        to be done once per game (unless the vanilla version changes).
+
+        Performance: Uses parallel hashing and batch database inserts.
+
         Args:
             vanilla_path:      Path to the vanilla/original game client folder
             progress_callback: Optional function called with (current, total, filename)
                               for progress reporting
             file_extensions:   Optional list of extensions to include (e.g., ['.spr', '.bmp'])
                               If None, all files are included
-        
+            batch_size:        Number of files to process in each batch
+
         Returns:
             Number of files added to the baseline
-            
+
         Example:
             >>> comparator = AssetComparator(db, game_id=1)
-            >>> count = comparator.build_baseline("E:\\RO_Vanilla")
+            >>> count = comparator.build_baseline("C:\\Games\\RO_Vanilla")
             >>> print(f"Added {count} files to baseline")
         """
         if not os.path.isdir(vanilla_path):
             raise ValueError(f"Vanilla path does not exist: {vanilla_path}")
-        
+
         print(f"[INFO] Building baseline from: {vanilla_path}")
-        
+        print(f"[INFO] Using {self.workers} parallel workers")
+
         # Collect all files
         all_files = []
+        ext_filter = set(e.lower() for e in file_extensions) if file_extensions else None
+
         for root, dirs, files in os.walk(vanilla_path):
             for filename in files:
-                # Check extension filter if provided
-                if file_extensions:
+                if ext_filter:
                     ext = os.path.splitext(filename)[1].lower()
-                    if ext not in [e.lower() for e in file_extensions]:
+                    if ext not in ext_filter:
                         continue
-                
+
                 full_path = os.path.join(root, filename)
-                # Calculate relative path from vanilla root
                 rel_path = os.path.relpath(full_path, vanilla_path)
                 all_files.append((full_path, rel_path))
-        
+
         total_files = len(all_files)
         print(f"[INFO] Found {total_files} files to process")
-        
-        # Process each file
+
+        # Process files in batches with parallel hashing
         added_count = 0
-        for idx, (full_path, rel_path) in enumerate(all_files):
-            try:
-                # Report progress
-                if progress_callback:
-                    progress_callback(idx + 1, total_files, rel_path)
-                
-                # Get file info
-                file_size = os.path.getsize(full_path)
-                md5_hash = self.hasher.hash_file_md5(full_path)
-                
-                if md5_hash:
-                    # Add to database
-                    self.db.add_vanilla_file(
-                        game_id=self.game_id,
-                        path=rel_path,
-                        hash_md5=md5_hash,
-                        size=file_size
-                    )
-                    
-                    # Update cache
-                    self.baseline_cache[rel_path.lower()] = md5_hash
-                    added_count += 1
-                    
-            except Exception as e:
-                print(f"[WARN] Failed to process {rel_path}: {e}")
-                continue
-        
+        processed = 0
+
+        for batch_start in range(0, total_files, batch_size):
+            batch_end = min(batch_start + batch_size, total_files)
+            batch = all_files[batch_start:batch_end]
+
+            # Hash files in parallel
+            file_paths = [fp for fp, _ in batch]
+            hashes = self.hasher.hash_files_parallel(file_paths)
+
+            # Prepare batch insert data
+            batch_data = []
+            for full_path, rel_path in batch:
+                try:
+                    md5_hash = hashes.get(full_path)
+                    if md5_hash:
+                        file_size = os.path.getsize(full_path)
+                        batch_data.append({
+                            'game_id': self.game_id,
+                            'path': rel_path,
+                            'hash_md5': md5_hash,
+                            'size': file_size
+                        })
+                        self.baseline_cache[rel_path.lower()] = md5_hash
+                        added_count += 1
+                except Exception as e:
+                    print(f"[WARN] Failed to process {rel_path}: {e}")
+
+            # Batch insert to database
+            if batch_data:
+                self._batch_insert_vanilla_files(batch_data)
+
+            processed += len(batch)
+            if progress_callback:
+                progress_callback(processed, total_files, f"Processed {processed}/{total_files}")
+
         print(f"[INFO] Added {added_count} files to baseline")
         return added_count
+
+    def _batch_insert_vanilla_files(self, files_data: List[Dict]):
+        """Batch insert vanilla files into database."""
+        from .database import VanillaFile
+        session = self.db.Session()
+        try:
+            session.bulk_insert_mappings(VanillaFile, files_data)
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            print(f"[ERROR] Batch insert failed: {e}")
+        finally:
+            session.close()
     
     def clear_baseline(self):
         """
@@ -267,12 +306,12 @@ class AssetComparator:
                       progress_callback: Callable[[int, int, str], None] = None
                       ) -> Dict[str, List[ComparisonResult]]:
         """
-        Compare multiple files against the vanilla baseline.
-        
+        Compare multiple files against the vanilla baseline using parallel hashing.
+
         Args:
             files: List of dicts with 'path' and 'rel_path' keys
             progress_callback: Optional progress callback
-            
+
         Returns:
             Dictionary with keys 'identical', 'modified', 'new', 'unknown'
             Each containing a list of ComparisonResult objects
@@ -283,18 +322,56 @@ class AssetComparator:
             'new': [],
             'unknown': []
         }
-        
+
         total = len(files)
+        if total == 0:
+            return results
+
+        # Parallel hash all files first
+        file_paths = [f['path'] for f in files]
+        hashes = self.hasher.hash_files_parallel(file_paths)
+
+        # Now compare using cached hashes (very fast)
         for idx, file_info in enumerate(files):
+            full_path = file_info['path']
+            rel_path = file_info['rel_path']
+
             if progress_callback:
-                progress_callback(idx + 1, total, file_info.get('rel_path', ''))
-            
-            result = self.compare_file(
-                file_info['path'],
-                file_info['rel_path']
-            )
-            results[result.status].append(result)
-        
+                progress_callback(idx + 1, total, rel_path)
+
+            # Get hash from parallel results
+            md5_hash = hashes.get(full_path)
+            file_size = os.path.getsize(full_path) if os.path.isfile(full_path) else 0
+
+            if not md5_hash:
+                results['unknown'].append(ComparisonResult(
+                    path=rel_path,
+                    status='unknown',
+                    hash_md5='',
+                    size=file_size
+                ))
+                continue
+
+            # Look up in baseline cache (case-insensitive)
+            path_lower = rel_path.lower()
+            vanilla_hash = self.baseline_cache.get(path_lower)
+
+            # Determine status
+            if vanilla_hash is None:
+                status = 'new'
+            elif vanilla_hash.lower() == md5_hash.lower():
+                status = 'identical'
+            else:
+                status = 'modified'
+
+            results[status].append(ComparisonResult(
+                path=rel_path,
+                status=status,
+                hash_md5=md5_hash,
+                size=file_size,
+                vanilla_hash=vanilla_hash
+            ))
+
         return results
     
     def compare_directory(self, client_path: str,
