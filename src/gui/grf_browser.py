@@ -203,8 +203,14 @@ class GRFBrowserWidget(QWidget):
         self._indexing_worker = None
         self._tree_build_worker = None
         self._current_archive = None  # Archive being indexed
+        self._debug_mode = False  # Debug mode for showing parse failures
         
         self._setup_ui()
+        
+        # Warn if PIL is not available
+        if not PIL_AVAILABLE:
+            print("[WARN] Pillow (PIL) not installed - image previews will be disabled")
+            print("[INFO] Install Pillow with: pip install Pillow")
     
     def _setup_ui(self):
         """Build the user interface."""
@@ -230,6 +236,13 @@ class GRFBrowserWidget(QWidget):
         self.search_edit.setPlaceholderText("Search files...")
         self.search_edit.textChanged.connect(self._on_search_changed)
         top_bar.addWidget(self.search_edit)
+        
+        # Debug mode toggle
+        self.debug_checkbox = QPushButton("🔍 Debug")
+        self.debug_checkbox.setCheckable(True)
+        self.debug_checkbox.setToolTip("Enable debug mode to show detailed parse errors")
+        self.debug_checkbox.toggled.connect(self._on_debug_toggled)
+        top_bar.addWidget(self.debug_checkbox)
         
         main_layout.addLayout(top_bar)
         
@@ -744,11 +757,70 @@ class GRFBrowserWidget(QWidget):
             self.file_info.setText("Error - see preview for details")
     
     def _preview_spr(self, data: bytes, file_path: str = ""):
-        """Preview SPR sprite file."""
+        """Preview SPR sprite file with enhanced error handling."""
+        # Check PIL availability
+        if not PIL_AVAILABLE:
+            error_msg = "⚠️ Pillow (PIL) not installed\n\n"
+            error_msg += "Image preview is disabled.\n"
+            error_msg += "Install Pillow with: pip install Pillow\n\n"
+            error_msg += "Showing hex dump instead:"
+            self.preview_label.setText(error_msg)
+            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            self._preview_hex(data)
+            return
+        
+        if not self.spr_parser:
+            error_msg = "⚠️ SPR Parser not available\n\n"
+            error_msg += "SPR parsing is disabled.\n\n"
+            error_msg += "Showing hex dump instead:"
+            self.preview_label.setText(error_msg)
+            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            self._preview_hex(data)
+            return
+        
         try:
             sprite = self.spr_parser.load_from_bytes(data)
-            if sprite and sprite.get_total_frames() > 0:
-                # Get first frame as image
+            
+            # Handle parse failure
+            if sprite is None:
+                error_msg = "❌ SPR Parse Failed\n\n"
+                error_msg += "The SPR file could not be parsed.\n"
+                error_msg += "Possible reasons:\n"
+                error_msg += "  • File is corrupted\n"
+                error_msg += "  • Invalid format or version\n"
+                error_msg += "  • Data is truncated or incomplete\n"
+                
+                if self._debug_mode:
+                    import traceback
+                    error_msg += f"\n\nDebug Info:\n{traceback.format_exc()}"
+                else:
+                    error_msg += "\n\n(Enable debug mode to see detailed error)"
+                
+                error_msg += "\n\nShowing hex dump:"
+                self.preview_label.setText(error_msg)
+                self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+                self._preview_hex(data)
+                return
+            
+            # Check frame count
+            total_frames = sprite.get_total_frames()
+            if total_frames == 0:
+                error_msg = "❌ SPR has 0 frames\n\n"
+                error_msg += "The SPR file was parsed but contains no frames.\n"
+                error_msg += "This may indicate:\n"
+                error_msg += "  • Empty or incomplete sprite file\n"
+                error_msg += "  • Corrupted frame data\n"
+                error_msg += "  • Parser read incorrect frame count\n\n"
+                error_msg += f"Indexed frames: {sprite.get_indexed_count()}\n"
+                error_msg += f"RGBA frames: {sprite.get_rgba_count()}\n\n"
+                error_msg += "Showing hex dump:"
+                self.preview_label.setText(error_msg)
+                self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+                self._preview_hex(data)
+                return
+            
+            # Try to render first frame
+            try:
                 img = sprite.get_frame_image(0)
                 if img and PIL_AVAILABLE:
                     self._display_image(img)
@@ -758,45 +830,146 @@ class GRFBrowserWidget(QWidget):
                     info += f"Indexed: {sprite.get_indexed_count()}\n"
                     info += f"RGBA: {sprite.get_rgba_count()}"
                     self.file_info.setText(info)
+                    return
                 else:
-                    self.preview_label.setText(f"SPR: {sprite.get_total_frames()} frames\n(Image rendering unavailable)")
-                    self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            else:
-                self.preview_label.setText("SPR: Invalid or empty sprite\n(File may be corrupted)")
-                self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    error_msg = f"SPR: {total_frames} frames\n"
+                    error_msg += "⚠️ Image rendering failed\n"
+                    error_msg += "(Frame 0 could not be converted to image)"
+                    self.preview_label.setText(error_msg)
+                    self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            except Exception as img_error:
+                error_msg = f"SPR: {total_frames} frames\n"
+                error_msg += f"⚠️ Failed to render frame 0: {str(img_error)}\n\n"
+                error_msg += "Showing hex dump:"
+                self.preview_label.setText(error_msg)
+                self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+                self._preview_hex(data)
+                
         except Exception as e:
             import traceback
-            error_msg = f"SPR Preview Error:\n{str(e)}"
+            error_msg = f"❌ SPR Preview Error:\n{str(e)}\n\n"
+            
+            if self._debug_mode:
+                error_msg += f"Full traceback:\n{traceback.format_exc()}\n\n"
+            else:
+                error_msg += "(Enable debug mode to see full traceback)\n\n"
+            
+            error_msg += "Showing hex dump:"
             self.preview_label.setText(error_msg)
             self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            self._preview_hex(data)
     
     def _preview_act(self, data: bytes, file_path: str = ""):
-        """Preview ACT action file."""
+        """Preview ACT action file with enhanced error handling."""
+        # Check PIL availability
+        if not PIL_AVAILABLE:
+            error_msg = "⚠️ Pillow (PIL) not installed\n\n"
+            error_msg += "Image preview is disabled.\n"
+            error_msg += "Install Pillow with: pip install Pillow\n\n"
+            error_msg += "Showing text info instead:"
+            self.preview_label.setText(error_msg)
+            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            # Fall through to text preview
+        
+        if not self.act_parser:
+            error_msg = "⚠️ ACT Parser not available\n\n"
+            error_msg += "ACT parsing is disabled.\n\n"
+            error_msg += "Showing hex dump instead:"
+            self.preview_label.setText(error_msg)
+            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            self._preview_hex(data)
+            return
+        
         try:
             act = self.act_parser.load_from_bytes(data)
-            if act:
-                # Try to load matching SPR file for visual preview
-                spr_path = file_path.replace('.act', '.spr') if file_path else ""
+            
+            # Handle parse failure
+            if act is None:
+                error_msg = "❌ ACT Parse Failed\n\n"
+                error_msg += "The ACT file could not be parsed.\n"
+                error_msg += "Possible reasons:\n"
+                error_msg += "  • File is corrupted\n"
+                error_msg += "  • Invalid format or version\n"
+                error_msg += "  • Data is truncated or incomplete\n"
                 
-                # Try to load SPR and render first frame
-                if spr_path and self.vfs and self.vfs.file_exists(spr_path) and self.spr_parser:
-                    spr_data = self.vfs.read_file(spr_path)
-                    if spr_data:
-                        try:
-                            sprite = self.spr_parser.load_from_bytes(spr_data)
-                            if sprite and sprite.get_total_frames() > 0 and PIL_AVAILABLE:
-                                # Try to render first frame of first action
-                                if act.get_action_count() > 0:
-                                    action = act.get_action(0)
-                                    if action.get_frame_count() > 0:
-                                        frame = action.get_frame(0)
-                                        if frame and len(frame.layers) > 0:
-                                            # Get sprite frame from first layer
-                                            layer = frame.layers[0]
-                                            sprite_idx = layer.sprite_index
-                                            if sprite_idx >= 0:
-                                                if layer.sprite_type == 1:
-                                                    sprite_idx += sprite.get_indexed_count()
+                if self._debug_mode:
+                    import traceback
+                    error_msg += f"\n\nDebug Info:\n{traceback.format_exc()}"
+                else:
+                    error_msg += "\n\n(Enable debug mode to see detailed error)"
+                
+                error_msg += "\n\nShowing hex dump:"
+                self.preview_label.setText(error_msg)
+                self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+                self._preview_hex(data)
+                return
+            
+            # Try to load matching SPR file for visual preview
+            spr_path = file_path.replace('.act', '.spr') if file_path else ""
+            spr_loaded = False
+            spr_error_msg = ""
+            
+            if not spr_path:
+                spr_error_msg = "No file path available to locate SPR file"
+            elif not self.vfs:
+                spr_error_msg = "GRF VFS not loaded - cannot search for SPR file"
+            elif not self.vfs.file_exists(spr_path):
+                spr_error_msg = f"Matching SPR file not found in GRF:\n{spr_path}\n\n"
+                spr_error_msg += "The ACT file requires a matching .spr file for visual preview.\n"
+                spr_error_msg += "Ensure both files are in the same directory."
+            elif not self.spr_parser:
+                spr_error_msg = "SPR Parser not available"
+            else:
+                # Try to read SPR file from GRF
+                spr_data = self.vfs.read_file(spr_path)
+                if not spr_data:
+                    spr_error_msg = f"Failed to read/decompress SPR file:\n{spr_path}\n\n"
+                    spr_error_msg += "The file exists in GRF but could not be read.\n"
+                    spr_error_msg += "Possible reasons:\n"
+                    spr_error_msg += "  • File is corrupted\n"
+                    spr_error_msg += "  • Unsupported compression/encryption\n"
+                    spr_error_msg += "  • Decompression failed"
+                else:
+                    # Successfully read SPR data, try to parse and render
+                    try:
+                        sprite = self.spr_parser.load_from_bytes(spr_data)
+                        if not sprite or sprite.get_total_frames() == 0:
+                            spr_error_msg = f"SPR file parsed but has 0 frames:\n{spr_path}"
+                        elif not PIL_AVAILABLE:
+                            spr_error_msg = "PIL not available - cannot render image"
+                        else:
+                            # Find first action with frames
+                            action_to_use = None
+                            action_idx = 0
+                            
+                            for i in range(act.get_action_count()):
+                                action = act.get_action(i)
+                                if action and action.get_frame_count() > 0:
+                                    action_to_use = action
+                                    action_idx = i
+                                    break
+                            
+                            if not action_to_use:
+                                spr_error_msg = "ACT file has no actions with frames"
+                            else:
+                                # Try to render first frame of the action
+                                frame = action_to_use.get_frame(0)
+                                if not frame or len(frame.layers) == 0:
+                                    spr_error_msg = f"Action {action_idx} has no layers in frame 0"
+                                else:
+                                    # Get sprite frame from first layer
+                                    layer = frame.layers[0]
+                                    sprite_idx = layer.sprite_index
+                                    if sprite_idx < 0:
+                                        spr_error_msg = f"Invalid sprite index: {sprite_idx}"
+                                    else:
+                                        if layer.sprite_type == 1:
+                                            sprite_idx += sprite.get_indexed_count()
+                                        
+                                        if sprite_idx >= sprite.get_total_frames():
+                                            spr_error_msg = f"Sprite index {sprite_idx} out of range (max: {sprite.get_total_frames() - 1})"
+                                        else:
+                                            try:
                                                 img = sprite.get_frame_image(sprite_idx)
                                                 if img:
                                                     self._display_image(img)
@@ -805,35 +978,68 @@ class GRFBrowserWidget(QWidget):
                                                     info += f"\n\nACT Details:\n"
                                                     info += f"Actions: {act.get_action_count()}\n"
                                                     info += f"Events: {len(act.events)}\n"
-                                                    info += f"Action 0: {action.get_frame_count()} frames, {len(frame.layers)} layers"
+                                                    info += f"Action {action_idx}: {action_to_use.get_frame_count()} frames, {len(frame.layers)} layers"
+                                                    if action_idx != 0:
+                                                        info += f"\n(Using Action {action_idx} - Action 0 has 0 frames)"
                                                     self.file_info.setText(info)
+                                                    spr_loaded = True
                                                     return
-                        except Exception:
-                            pass  # Fall through to text preview
-                
-                # Text-only preview if SPR not available
-                info = f"ACT Version: {act.version}\n"
-                info += f"Actions: {act.get_action_count()}\n"
-                info += f"Events: {len(act.events)}\n"
-                
-                if act.get_action_count() > 0:
-                    action = act.get_action(0)
-                    if action:
-                        info += f"\nAction 0: {action.get_frame_count()} frames"
-                        if action.get_frame_count() > 0:
-                            frame = action.get_frame(0)
-                            if frame:
-                                info += f", {len(frame.layers)} layers"
-                
-                self.preview_label.setText(info)
-                self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-            else:
-                self.preview_label.setText("ACT: Invalid action file\n(File may be corrupted or incomplete)")
-                self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                                                else:
+                                                    spr_error_msg = f"Failed to get image for sprite index {sprite_idx}"
+                                            except Exception as img_error:
+                                                spr_error_msg = f"Failed to render sprite frame: {str(img_error)}"
+                    except Exception as spr_parse_error:
+                        spr_error_msg = f"Failed to parse SPR file:\n{str(spr_parse_error)}"
+                        if self._debug_mode:
+                            import traceback
+                            spr_error_msg += f"\n\n{traceback.format_exc()}"
+            
+            # Fall back to text preview
+            info = f"ACT Version: {act.version}\n"
+            info += f"Actions: {act.get_action_count()}\n"
+            info += f"Events: {len(act.events)}\n\n"
+            
+            # Try to find first action with frames
+            action_with_frames = None
+            action_idx = -1
+            for i in range(act.get_action_count()):
+                action = act.get_action(i)
+                if action and action.get_frame_count() > 0:
+                    action_with_frames = action
+                    action_idx = i
+                    break
+            
+            if action_with_frames:
+                frame = action_with_frames.get_frame(0)
+                info += f"Action {action_idx}: {action_with_frames.get_frame_count()} frames"
+                if frame:
+                    info += f", {len(frame.layers)} layers"
+            elif act.get_action_count() > 0:
+                action = act.get_action(0)
+                info += f"Action 0: {action.get_frame_count() if action else 0} frames"
+                if action and action.get_frame_count() == 0:
+                    info += " (empty)"
+            
+            # Add SPR loading error message if available
+            if spr_error_msg:
+                info += f"\n\n⚠️ Visual Preview Unavailable:\n{spr_error_msg}"
+            
+            self.preview_label.setText(info)
+            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            
         except Exception as e:
-            error_msg = f"ACT Preview Error:\n{str(e)}"
+            import traceback
+            error_msg = f"❌ ACT Preview Error:\n{str(e)}\n\n"
+            
+            if self._debug_mode:
+                error_msg += f"Full traceback:\n{traceback.format_exc()}\n\n"
+            else:
+                error_msg += "(Enable debug mode to see full traceback)\n\n"
+            
+            error_msg += "Showing hex dump:"
             self.preview_label.setText(error_msg)
             self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            self._preview_hex(data)
     
     def _preview_image(self, data: bytes):
         """Preview image file."""
@@ -1327,6 +1533,19 @@ class GRFBrowserWidget(QWidget):
         
         self.preview_label.setPixmap(pixmap)
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    
+    def _on_debug_toggled(self, enabled: bool):
+        """Handle debug mode toggle."""
+        self._debug_mode = enabled
+        if enabled:
+            self.debug_checkbox.setText("🔍 Debug ON")
+        else:
+            self.debug_checkbox.setText("🔍 Debug")
+        
+        # If a file is currently previewed, refresh it to show/hide debug info
+        if self._current_file_path:
+            # Re-read and re-preview the current file
+            self._preview_file(self._current_file_path)
     
     def _on_search_changed(self, text: str):
         """Handle search text change."""
