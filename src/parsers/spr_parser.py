@@ -401,7 +401,7 @@ class SPRParser:
     
     def load_from_bytes(self, data: bytes) -> Optional[SPRSprite]:
         """
-        Load an SPR sprite from raw bytes.
+        Load an SPR sprite from raw bytes with full error handling.
         
         This is useful when reading sprites directly from GRF archives
         without extracting them to disk first.
@@ -412,15 +412,14 @@ class SPRParser:
         Returns:
             SPRSprite object if successful, None on error
         """
+        if not data or len(data) < 8:
+            # Silently fail - might be incomplete data
+            return None
+        
         try:
-            # Check minimum size
-            if len(data) < 6:
-                print("[ERROR] SPR data too small")
-                return None
-            
             # Check signature
             if data[0:2] != SPR_SIGNATURE:
-                print(f"[ERROR] Invalid SPR signature: {data[0:2]}")
+                # Silently fail - might be wrong file type
                 return None
             
             # Read version (minor byte, major byte)
@@ -428,30 +427,60 @@ class SPRParser:
             version_major = data[3]
             version = (version_major, version_minor)
             
+            # Validate version (reasonable range: 1.0 to 3.0)
+            if version_major < 1 or version_major > 3:
+                # Invalid version - might be corrupted data
+                return None
+            
             # Create sprite object
             sprite = SPRSprite(version=version)
             
             # Read frame counts
             # Offset 4-5: indexed frame count (uint16)
             # Offset 6-7: rgba frame count (uint16) - only in version >= 2.0
+            if len(data) < 6:
+                return None
+            
             indexed_count = struct.unpack('<H', data[4:6])[0]
+            
+            # Validate frame count (max reasonable is ~1000 frames per sprite)
+            if indexed_count > 1000:
+                # Suspiciously large - likely corrupted
+                return None
             
             rgba_count = 0
             offset = 6
             
             if version >= SPR_VERSION_2_0:
+                if len(data) < 8:
+                    return None
                 rgba_count = struct.unpack('<H', data[6:8])[0]
+                # Validate RGBA frame count
+                if rgba_count > 1000:
+                    return None
                 offset = 8
             
             # Read indexed frames
             for i in range(indexed_count):
-                frame, offset = self._read_indexed_frame(data, offset, version)
-                sprite.indexed_frames.append(frame)
+                if offset >= len(data):
+                    break  # Truncated data
+                try:
+                    frame, offset = self._read_indexed_frame(data, offset, version)
+                    sprite.indexed_frames.append(frame)
+                except (struct.error, ValueError, IndexError):
+                    # Skip corrupted frame
+                    break
             
             # Read RGBA frames
             for i in range(rgba_count):
-                frame, offset = self._read_rgba_frame(data, offset)
-                sprite.rgba_frames.append(frame)
+                if offset >= len(data):
+                    break  # Truncated data
+                try:
+                    frame, offset = self._read_rgba_frame(data, offset)
+                    sprite.rgba_frames.append(frame)
+                except (struct.error, ValueError, IndexError):
+                    # Skip corrupted frame
+                    break
             
             # Read palette (at the end of file, 1024 bytes)
             # Palette is present in all versions
@@ -461,12 +490,18 @@ class SPRParser:
                 # Use default grayscale palette
                 sprite.palette = DEFAULT_PALETTE
             
+            # Validate we got at least one frame
+            if sprite.get_total_frames() == 0:
+                return None
+            
             return sprite
             
+        except (struct.error, ValueError, IndexError) as e:
+            # Silently fail - corrupted data
+            return None
         except Exception as e:
-            print(f"[ERROR] Failed to parse SPR data: {e}")
-            import traceback
-            traceback.print_exc()
+            # Log unexpected errors
+            print(f"[ERROR] SPR parse failed: {e}")
             return None
     
     def _read_indexed_frame(self, data: bytes, offset: int, 

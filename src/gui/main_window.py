@@ -57,6 +57,13 @@ except ImportError:
     ACT_SPR_EDITOR_AVAILABLE = False
     print("[INFO] ACT/SPR Editor module not loaded - this is optional")
 
+try:
+    from src.gui.grf_browser import GRFBrowserWidget
+    GRF_BROWSER_AVAILABLE = True
+except ImportError:
+    GRF_BROWSER_AVAILABLE = False
+    print("[INFO] GRF Browser module not loaded - this is optional")
+
 
 # ==============================================================================
 # ADD GAME DIALOG
@@ -817,6 +824,7 @@ class MainWindow(QMainWindow):
         self._create_extract_tab()    # Main functionality first
         self._create_servers_tab()
         self._create_results_tab()
+        self._create_grf_browser_tab()  # GRF Browser (browse GRF contents)
         self._create_grf_editor_tab()  # GRF Editor/Creator (archive management)
         self._create_act_spr_editor_tab()  # ACT/SPR Editor (binary file editing)
         self._create_character_designer_tab()  # Character Designer (visual preview)
@@ -1063,6 +1071,51 @@ class MainWindow(QMainWindow):
         layout.addLayout(lists_layout)
         
         self.tabs.addTab(tab, "📊 Results")
+    
+    def _create_grf_browser_tab(self):
+        """Create GRF Browser tab for browsing GRF contents."""
+        if not GRF_BROWSER_AVAILABLE:
+            # Create placeholder tab
+            tab = QWidget()
+            layout = QVBoxLayout(tab)
+            
+            info_label = QLabel(
+                "<h2>📂 GRF Browser</h2>"
+                "<p>The GRF Browser module could not be loaded.</p>"
+                "<p>Make sure the following files exist:</p>"
+                "<ul>"
+                "<li>src/gui/grf_browser.py</li>"
+                "<li>src/extractors/grf_vfs.py</li>"
+                "</ul>"
+            )
+            info_label.setTextFormat(Qt.TextFormat.RichText)
+            info_label.setWordWrap(True)
+            info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(info_label)
+            layout.addStretch()
+            
+            self.tabs.addTab(tab, "📂 GRF Browser")
+            return
+        
+        # Create the GRF Browser widget
+        self.grf_browser = GRFBrowserWidget()
+        
+        # Connect signals for integration
+        self.grf_browser.file_selected.connect(self._on_grf_browser_file_selected)
+        
+        self.tabs.addTab(self.grf_browser, "📂 GRF Browser")
+        self._log("GRF Browser loaded - Browse GRF archives without extraction")
+    
+    def _on_grf_browser_file_selected(self, file_path: str):
+        """
+        Handle file selection in GRF Browser.
+        
+        NOTE: This only logs the selection. Tab switching is handled by 
+        right-click context menu -> "Open in Character Designer" only.
+        """
+        # Just log the selection - do NOT auto-switch tabs
+        self._log(f"GRF Browser: Selected file: {file_path}")
+        # Tab switching removed - user can right-click for "Open in Character Designer"
     
     def _create_act_spr_editor_tab(self):
         """

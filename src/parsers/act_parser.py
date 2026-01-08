@@ -461,7 +461,7 @@ class ACTParser:
     
     def load_from_bytes(self, data: bytes) -> Optional[ACTData]:
         """
-        Load ACT data from raw bytes.
+        Load ACT data from raw bytes with full error handling.
         
         This is useful when reading directly from GRF archives.
         
@@ -471,15 +471,14 @@ class ACTParser:
         Returns:
             ACTData object if successful, None on error
         """
+        if not data or len(data) < 16:
+            # Silently fail - might be incomplete data from GRF
+            return None
+        
         try:
-            # Check minimum size
-            if len(data) < 10:
-                print("[ERROR] ACT data too small")
-                return None
-            
             # Check signature
             if data[0:2] != ACT_SIGNATURE:
-                print(f"[ERROR] Invalid ACT signature: {data[0:2]}")
+                # Silently fail - might be wrong file type
                 return None
             
             # Read version (minor byte, major byte - little endian)
@@ -487,8 +486,18 @@ class ACTParser:
             version_major = data[3]
             version = (version_major, version_minor)
             
+            # Validate version (reasonable range: 1.0 to 3.0)
+            if version_major < 1 or version_major > 3:
+                # Invalid version - might be corrupted data
+                return None
+            
             # Read action count
             action_count = struct.unpack('<H', data[4:6])[0]
+            
+            # Validate action count (should be reasonable - max ~200 actions for RO)
+            if action_count == 0 or action_count > 200:
+                # Invalid action count - might be corrupted data
+                return None
             
             # Skip reserved bytes (10 bytes of zeros in most versions)
             offset = 6
@@ -500,8 +509,25 @@ class ACTParser:
             
             # Parse each action
             for i in range(action_count):
-                action, offset = self._read_action(data, offset, version)
-                act_data.actions.append(action)
+                if offset >= len(data):
+                    # Data truncated - stop silently
+                    break
+                try:
+                    action, offset = self._read_action(data, offset, version)
+                    if action:  # Only append if action was successfully parsed
+                        act_data.actions.append(action)
+                except (struct.error, ValueError) as e:
+                    # Data corruption detected - stop parsing silently
+                    # Don't spam errors for corrupted files
+                    break
+                except Exception as e:
+                    # Unexpected error - stop parsing
+                    break
+            
+            # Validate we got some actions
+            if len(act_data.actions) == 0:
+                # No valid actions parsed - file is likely corrupted
+                return None
             
             # Read events (sound names) if version supports it
             if version >= ACT_VERSION_2_1 and offset < len(data):
@@ -544,13 +570,32 @@ class ACTParser:
         action = ACTAction()
         
         # Read frame count
+        if offset + 4 > len(data):
+            raise struct.error(f"Not enough data for frame count at offset {offset}")
+        
         frame_count = struct.unpack('<I', data[offset:offset + 4])[0]
         offset += 4
         
+        # Validate frame count (reasonable max: ~100 frames per action)
+        if frame_count > 100:
+            raise ValueError(f"Invalid frame count: {frame_count} (max expected: 100)")
+        if frame_count == 0xFFFFFFFF or frame_count > 0x7FFFFFFF:
+            raise ValueError(f"Invalid frame count (likely corruption): {frame_count}")
+        
         # Parse each frame
         for i in range(frame_count):
-            frame, offset = self._read_frame(data, offset, version)
-            action.frames.append(frame)
+            if offset >= len(data):
+                # Silently stop - truncated data
+                break
+            try:
+                frame, offset = self._read_frame(data, offset, version)
+                action.frames.append(frame)
+            except (struct.error, ValueError) as e:
+                # Stop parsing on corruption - don't spam errors
+                break
+            except Exception as e:
+                # Unexpected error - stop parsing
+                break
         
         return action, offset
     
@@ -569,12 +614,29 @@ class ACTParser:
         """
         frame = ACTFrame()
         
+        # Validate offset for unknown data
+        if offset + 4 > len(data):
+            raise struct.error(f"Not enough data for frame header at offset {offset} (need 4 bytes, have {len(data) - offset})")
+        
         # Skip unknown data (4 bytes in most versions)
         offset += 4
+        
+        # Validate offset for layer count
+        if offset + 4 > len(data):
+            raise struct.error(f"Not enough data for layer count at offset {offset} (need 4 bytes, have {len(data) - offset})")
         
         # Read layer count
         layer_count = struct.unpack('<I', data[offset:offset + 4])[0]
         offset += 4
+        
+        # Validate layer count (sanity check - max reasonable is ~50 layers per frame)
+        if layer_count > 100:
+            # Invalid layer count - data is corrupted
+            raise ValueError(f"Invalid layer count: {layer_count} (max expected: 100)")
+        
+        # Also check for negative values when interpreted as signed
+        if layer_count == 0xFFFFFFFF or layer_count > 0x7FFFFFFF:
+            raise ValueError(f"Invalid layer count (likely corruption): {layer_count}")
         
         # Parse each layer
         for i in range(layer_count):
@@ -583,6 +645,8 @@ class ACTParser:
         
         # Read event ID (int32, -1 = no event)
         if version >= ACT_VERSION_2_0:
+            if offset + 4 > len(data):
+                raise struct.error(f"Not enough data for event_id at offset {offset} (need 4 bytes, have {len(data) - offset})")
             frame.event_id = struct.unpack('<i', data[offset:offset + 4])[0]
             offset += 4
         
@@ -620,17 +684,31 @@ class ACTParser:
         """
         layer = ACTLayer()
         
+        # Validate offset for position x
+        if offset + 4 > len(data):
+            raise struct.error(f"Not enough data for layer.x at offset {offset} (need 4 bytes, have {len(data) - offset})")
+        
         # Read position (x, y as int32)
         layer.x = struct.unpack('<i', data[offset:offset + 4])[0]
         offset += 4
+        
+        if offset + 4 > len(data):
+            raise struct.error(f"Not enough data for layer.y at offset {offset} (need 4 bytes, have {len(data) - offset})")
+        
         layer.y = struct.unpack('<i', data[offset:offset + 4])[0]
         offset += 4
         
         # Read sprite index (int32)
+        if offset + 4 > len(data):
+            raise struct.error(f"Not enough data for layer.sprite_index at offset {offset} (need 4 bytes, have {len(data) - offset})")
+        
         layer.sprite_index = struct.unpack('<i', data[offset:offset + 4])[0]
         offset += 4
         
         # Read mirror flag (int32, 0 or 1)
+        if offset + 4 > len(data):
+            raise struct.error(f"Not enough data for layer.mirror at offset {offset} (need 4 bytes, have {len(data) - offset})")
+        
         mirror_val = struct.unpack('<i', data[offset:offset + 4])[0]
         layer.mirror = (mirror_val != 0)
         offset += 4
@@ -638,6 +716,9 @@ class ACTParser:
         # Version 2.0+ has additional properties
         if version >= ACT_VERSION_2_0:
             # Read color (RGBA, 4 bytes)
+            if offset + 4 > len(data):
+                raise struct.error(f"Not enough data for layer.color at offset {offset} (need 4 bytes, have {len(data) - offset})")
+            
             r = data[offset]
             g = data[offset + 1]
             b = data[offset + 2]
@@ -646,23 +727,43 @@ class ACTParser:
             offset += 4
             
             # Read scale (x, y as float32)
+            if offset + 4 > len(data):
+                raise struct.error(f"Not enough data for layer.scale_x at offset {offset} (need 4 bytes, have {len(data) - offset})")
+            
             layer.scale_x = struct.unpack('<f', data[offset:offset + 4])[0]
             offset += 4
+            
+            if offset + 4 > len(data):
+                raise struct.error(f"Not enough data for layer.scale_y at offset {offset} (need 4 bytes, have {len(data) - offset})")
+            
             layer.scale_y = struct.unpack('<f', data[offset:offset + 4])[0]
             offset += 4
             
             # Read rotation (int32, degrees)
+            if offset + 4 > len(data):
+                raise struct.error(f"Not enough data for layer.rotation at offset {offset} (need 4 bytes, have {len(data) - offset})")
+            
             layer.rotation = struct.unpack('<i', data[offset:offset + 4])[0]
             offset += 4
             
             # Read sprite type (int32, 0 = indexed, 1 = rgba)
+            if offset + 4 > len(data):
+                raise struct.error(f"Not enough data for layer.sprite_type at offset {offset} (need 4 bytes, have {len(data) - offset})")
+            
             layer.sprite_type = struct.unpack('<i', data[offset:offset + 4])[0]
             offset += 4
         
         # Version 2.3+ has width/height
         if version >= ACT_VERSION_2_3:
+            if offset + 4 > len(data):
+                raise struct.error(f"Not enough data for layer.width at offset {offset} (need 4 bytes, have {len(data) - offset})")
+            
             layer.width = struct.unpack('<i', data[offset:offset + 4])[0]
             offset += 4
+            
+            if offset + 4 > len(data):
+                raise struct.error(f"Not enough data for layer.height at offset {offset} (need 4 bytes, have {len(data) - offset})")
+            
             layer.height = struct.unpack('<i', data[offset:offset + 4])[0]
             offset += 4
         

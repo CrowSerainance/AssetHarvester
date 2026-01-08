@@ -272,21 +272,21 @@ class GRFExtractor(BaseExtractor):
             # Read compressed data
             compressed_data = self._file_handle.read(entry.compressed_size)
             
-            # Check if encrypted
-            if entry.is_encrypted:
-                # TODO: Implement DES decryption
-                print(f"[WARN] File is encrypted, skipping: {file_path}")
+            # Determine compression type from flags
+            flags = 0
+            # We need to get flags from entry - for now, infer from encrypted flag
+            # TODO: Store flags in FileEntry for better compression detection
+            
+            # Decompress with improved error handling
+            data = self._decompress_file_data(entry, compressed_data, file_path)
+            
+            if data is None:
                 return None
             
-            # Decompress if needed
-            if entry.compressed_size != entry.size and entry.compressed_size > 0:
-                try:
-                    data = zlib.decompress(compressed_data)
-                except zlib.error:
-                    # Some files may not be compressed despite size difference
-                    data = compressed_data
-            else:
-                data = compressed_data
+            # Validate final data size
+            if len(data) == 0:
+                print(f"[WARN] Empty file data for {file_path}")
+                return None
             
             return data
             
@@ -297,6 +297,85 @@ class GRFExtractor(BaseExtractor):
     # ==========================================================================
     # PRIVATE HELPER METHODS
     # ==========================================================================
+    
+    def _decompress_file_data(self, entry: FileEntry, raw_data: bytes, file_path: str) -> Optional[bytes]:
+        """
+        Decompress file data based on compression type.
+        
+        Handles multiple fallback strategies for problematic files.
+        
+        Args:
+            entry: FileEntry with size information
+            raw_data: Raw compressed/encrypted data
+            file_path: File path for error messages
+            
+        Returns:
+            Decompressed data, or None on error
+        """
+        try:
+            # Check if encrypted (based on entry flag)
+            if entry.is_encrypted:
+                # Try DES decryption
+                try:
+                    from .grf_crypto import grf_des_decrypt
+                    raw_data = grf_des_decrypt(raw_data, 0)  # TODO: Use actual table position
+                except ImportError:
+                    print(f"[WARN] DES decryption not available for {file_path}")
+                    return None
+                except Exception as e:
+                    print(f"[WARN] DES decryption failed for {file_path}: {e}")
+                    # Continue - might still be compressed
+            
+            # Determine compression type
+            # If sizes differ, assume zlib compression (most common)
+            if entry.compressed_size != entry.size and entry.compressed_size > 0:
+                # Try standard zlib decompression
+                try:
+                    data = zlib.decompress(raw_data)
+                    # Verify decompressed size matches expected
+                    if len(data) == entry.size:
+                        return data
+                    elif abs(len(data) - entry.size) < 10:  # Allow small differences
+                        print(f"[WARN] Size mismatch for {file_path}: expected {entry.size}, got {len(data)} (using anyway)")
+                        return data
+                    else:
+                        # Size mismatch - might be wrong compression type
+                        print(f"[WARN] Size mismatch for {file_path}: expected {entry.size}, got {len(data)}")
+                except zlib.error as e:
+                    error_str = str(e).lower()
+                    
+                    # Try without header (raw deflate)
+                    if "incorrect header check" in error_str:
+                        try:
+                            data = zlib.decompress(raw_data, -zlib.MAX_WBITS)
+                            if len(data) == entry.size or abs(len(data) - entry.size) < 10:
+                                return data
+                        except:
+                            pass
+                    
+                    # Check if data is already uncompressed
+                    if "unknown compression method" in error_str or "incorrect header check" in error_str:
+                        if len(raw_data) == entry.size:
+                            # Data is not compressed despite size difference
+                            return raw_data
+                    
+                    # Final fallback: return raw data if size matches
+                    if len(raw_data) == entry.size:
+                        print(f"[WARN] Decompression failed for {file_path}, using raw data")
+                        return raw_data
+                    
+                    print(f"[WARN] Decompression failed for {file_path}: {e}")
+                    return None
+            else:
+                # No compression (sizes match) - return raw data
+                return raw_data
+                
+        except Exception as e:
+            print(f"[ERROR] Failed to decompress {file_path}: {e}")
+            # Last resort: return raw data if size matches
+            if len(raw_data) == entry.size:
+                return raw_data
+            return None
     
     def _read_header(self) -> bool:
         """

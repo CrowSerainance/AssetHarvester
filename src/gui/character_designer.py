@@ -73,6 +73,14 @@ except ImportError:
     PARSERS_AVAILABLE = False
     print("[WARN] SPR/ACT parsers not available")
 
+# Import GRF VFS for virtual file system support
+try:
+    from src.extractors.grf_vfs import GRFVirtualFileSystem
+    VFS_AVAILABLE = True
+except ImportError:
+    VFS_AVAILABLE = False
+    print("[WARN] GRF VFS not available")
+
 # Try to import database for custom detection
 try:
     from src.core.database import Database
@@ -146,6 +154,10 @@ class SpriteCompositor:
     """
     Composites multiple sprite layers to create a complete character render.
     Enhanced version with support for comparison and batch operations.
+    
+    Can work with either:
+    - Extracted folder path (traditional mode)
+    - GRF file path (direct archive reading - no extraction needed)
     """
     
     def __init__(self, resource_path: str = ""):
@@ -153,6 +165,9 @@ class SpriteCompositor:
         self.spr_parser = SPRParser() if PARSERS_AVAILABLE else None
         self.act_parser = ACTParser() if PARSERS_AVAILABLE else None
         self.cache: Dict[str, Tuple[SPRSprite, ACTData]] = {}
+        
+        # GRF support - read directly from archives using Virtual File System
+        self.grf_vfs: Optional['GRFVirtualFileSystem'] = None  # Virtual File System for GRF files
         
         # Current character state
         self.job = "Novice"
@@ -167,36 +182,107 @@ class SpriteCompositor:
         self.garment = 0
         self.body_palette = -1
     
-    def set_resource_path(self, path: str):
+    def set_resource_path(self, path: str) -> bool:
         """
         Set the resource path and clear cache.
         
-        Auto-detects if user selected the 'data' folder instead of parent.
-        The path should be the folder CONTAINING 'data/sprite/', not 'data' itself.
+        Accepts either:
+        - Extracted folder path (traditional mode)
+        - GRF file path (direct archive reading - no extraction needed)
+        
+        Args:
+            path: Path to extracted RO data folder OR GRF file
+            
+        Returns:
+            True if path is valid, False otherwise
         """
         # Normalize path
         path = os.path.normpath(path)
         
+        # Clear previous GRF VFS and cache
+        self.grf_vfs = None
+        self.cache.clear()
+        
+        # Check if it's a GRF file
+        if os.path.isfile(path) and path.lower().endswith(('.grf', '.gpf')):
+            # GRF mode - load directly
+            return self.set_grf_source([path])
+        
+        # Check if it's a folder containing GRF files
+        if os.path.isdir(path):
+            try:
+                grf_files = [os.path.join(path, f) for f in os.listdir(path) 
+                            if f.lower().endswith(('.grf', '.gpf'))]
+                if grf_files:
+                    # Sort: data.grf first, then rdata.grf, etc.
+                    grf_files.sort(key=lambda x: (not 'data' in x.lower(), x.lower()))
+                    return self.set_grf_source(grf_files)
+            except PermissionError:
+                pass
+        
+        # Traditional folder mode - extracted files only
         # Auto-detect: if user selected 'data' folder, go up one level
-        # Check if path ends with 'data' and contains 'sprite' subfolder
         if os.path.basename(path).lower() == 'data':
             sprite_check = os.path.join(path, 'sprite')
             if os.path.isdir(sprite_check):
-                # User selected 'data' folder - go up one level
                 path = os.path.dirname(path)
                 print(f"[INFO] Auto-corrected path to parent: {path}")
         
-        # Also check if data/sprite exists at expected location
+        # Check if data/sprite exists at expected location
         expected_sprite = os.path.join(path, 'data', 'sprite')
         if not os.path.isdir(expected_sprite):
-            # Try alternative: maybe sprites are directly in path/sprite
             alt_sprite = os.path.join(path, 'sprite')
             if os.path.isdir(alt_sprite):
                 print(f"[INFO] Found sprites at {alt_sprite} - adjusting paths")
+            else:
+                # No sprite folder found - invalid path
+                print(f"[ERROR] No sprite folder found at: {expected_sprite} or {alt_sprite}")
+                return False
         
         self.resource_path = path
-        self.cache.clear()
-        print(f"[INFO] Resource path set to: {path}")
+        print(f"[INFO] Resource path set to: {path} (folder mode)")
+        return True
+    
+    def set_grf_source(self, grf_paths: List[str]) -> bool:
+        """
+        Set GRF file(s) as resource source.
+        
+        Args:
+            grf_paths: List of GRF file paths (later paths override earlier ones)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            from src.extractors.grf_vfs import GRFVirtualFileSystem
+            
+            self.grf_vfs = GRFVirtualFileSystem(cache_size_mb=100)
+            
+            # Load GRF files with priority (first = lowest priority, last = highest)
+            for i, grf_path in enumerate(grf_paths):
+                if not os.path.isfile(grf_path):
+                    print(f"[WARN] GRF file not found: {grf_path}")
+                    continue
+                
+                if self.grf_vfs.load_grf(grf_path, priority=i):
+                    print(f"[INFO] Loaded GRF: {os.path.basename(grf_path)} (priority {i})")
+                else:
+                    print(f"[ERROR] Failed to load GRF: {grf_path}")
+            
+            if len(self.grf_vfs._archives) == 0:
+                print("[ERROR] No GRF files were loaded")
+                self.grf_vfs = None
+                return False
+            
+            # Clear folder path when using GRF
+            self.resource_path = ""
+            print(f"[INFO] GRF source set: {len(grf_paths)} file(s) loaded")
+            return True
+            
+        except ImportError as e:
+            print(f"[ERROR] GRF VFS not available: {e}")
+            return False
+    
     
     def get_sprite_path(self, sprite_type: str, sprite_id: int = 0) -> str:
         """
@@ -232,6 +318,8 @@ class SpriteCompositor:
         """
         Load a sprite and its action file.
         
+        Works with both extracted folders and GRF files.
+        
         Args:
             relative_path: Path relative to resource folder (without extension)
                           Example: "data/sprite/인간족/몸통/남/초보자_남"
@@ -247,43 +335,71 @@ class SpriteCompositor:
         if relative_path in self.cache:
             return self.cache[relative_path]
         
-        # Build full paths
-        base_path = os.path.join(self.resource_path, relative_path)
-        spr_path = base_path + ".spr"
-        act_path = base_path + ".act"
+        # Determine if we're using GRF mode or folder mode
+        if self.grf_vfs:
+            # GRF mode - read directly from archives using VFS
+            # Convert path to GRF format (forward slashes for VFS)
+            grf_spr_path = relative_path.replace('\\', '/') + ".spr"
+            grf_act_path = relative_path.replace('\\', '/') + ".act"
+            
+            spr_data = self.grf_vfs.read_file(grf_spr_path)
+            act_data = self.grf_vfs.read_file(grf_act_path)
+            
+            if not spr_data:
+                return None
+            
+            if not act_data:
+                return None
+            
+            # Load from bytes
+            try:
+                sprite = self.spr_parser.load_from_bytes(spr_data)
+            except Exception as e:
+                print(f"[ERROR] Failed to parse SPR from GRF {grf_spr_path}: {e}")
+                return None
+            
+            if not sprite:
+                return None
+            
+            try:
+                act = self.act_parser.load_from_bytes(act_data)
+                if not act:
+                    # Parser returned None - file might be corrupted or invalid
+                    return None
+            except Exception as e:
+                # Parser threw exception - skip this file silently
+                return None
+            
+            if not sprite or not act:
+                return None
+            
+            # Cache and return
+            self.cache[relative_path] = (sprite, act)
+            return (sprite, act)
         
-        # Debug: show what we're looking for
-        if not os.path.exists(spr_path):
-            print(f"[DEBUG] SPR not found: {spr_path}")
-            # Try to help diagnose the issue
-            parent_dir = os.path.dirname(base_path)
-            if os.path.isdir(parent_dir):
-                print(f"[DEBUG] Parent folder exists: {parent_dir}")
-                try:
-                    files = os.listdir(parent_dir)[:5]  # Show first 5 files
-                    print(f"[DEBUG] Sample files in folder: {files}")
-                except:
-                    pass
-            else:
-                print(f"[DEBUG] Parent folder NOT found: {parent_dir}")
-            return None
-        
-        if not os.path.exists(act_path):
-            print(f"[DEBUG] ACT not found: {act_path}")
-            return None
-        
-        # Load the files
-        sprite = self.spr_parser.load(spr_path)
-        action = self.act_parser.load(act_path)
-        
-        if sprite and action:
-            self.cache[relative_path] = (sprite, action)
-            print(f"[DEBUG] Loaded: {relative_path}")
-            return (sprite, action)
         else:
-            print(f"[DEBUG] Failed to parse: {relative_path}")
-        
-        return None
+            # Folder mode - traditional file system reading
+            base_path = os.path.join(self.resource_path, relative_path)
+            spr_path = base_path + ".spr"
+            act_path = base_path + ".act"
+            
+            # Check if files exist
+            if not os.path.isfile(spr_path) or not os.path.isfile(act_path):
+                return None
+            
+            # Load SPR
+            sprite = self.spr_parser.load(spr_path)
+            if not sprite:
+                return None
+            
+            # Load ACT
+            act = self.act_parser.load(act_path)
+            if not act:
+                return None
+            
+            # Cache and return
+            self.cache[relative_path] = (sprite, act)
+            return (sprite, act)
     
     def get_body_path(self) -> str:
         """Get the sprite path for the current body."""
@@ -312,81 +428,102 @@ class SpriteCompositor:
         if not PIL_AVAILABLE:
             return None
         
-        actual_action = action_index + direction
-        canvas_size = 500
-        center = canvas_size // 2
-        
-        canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-        
-        # Load and draw body
-        body_path = self.get_body_path()
-        body_data = self.load_sprite(body_path)
-        
-        if body_data:
-            sprite, action_data = body_data
-            self._draw_sprite_layer(canvas, sprite, action_data, 
-                                   actual_action, frame_index, center, center)
-        
-        # Load and draw head
-        head_path = self.get_head_path()
-        head_data = self.load_sprite(head_path)
-        
-        if head_data:
-            sprite, action_data = head_data
-            head_offset_x, head_offset_y = 0, 0
+        try:
+            actual_action = action_index + direction
+            canvas_size = 500
+            center = canvas_size // 2
+            
+            canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+            
+            # Load and draw body
+            body_path = self.get_body_path()
+            body_data = self.load_sprite(body_path)
             
             if body_data:
-                body_sprite, body_action = body_data
-                body_act = body_action.get_action(actual_action)
-                if body_act:
-                    body_frame = body_act.get_frame(frame_index % body_act.get_frame_count())
-                    if body_frame and body_frame.anchors:
-                        anchor = body_frame.anchors[0]
-                        head_offset_x = anchor.x
-                        head_offset_y = anchor.y
+                sprite, action_data = body_data
+                self._draw_sprite_layer(canvas, sprite, action_data, 
+                                       actual_action, frame_index, center, center)
             
-            self._draw_sprite_layer(canvas, sprite, action_data,
-                                   actual_action, frame_index,
-                                   center + head_offset_x, 
-                                   center + head_offset_y)
-        
-        # Draw headgear
-        for hg_id in [self.headgear_low, self.headgear_mid, self.headgear_top]:
-            if hg_id > 0:
-                hg_path = self.get_headgear_path(hg_id)
-                hg_data = self.load_sprite(hg_path)
-                if hg_data:
-                    sprite, action_data = hg_data
-                    self._draw_sprite_layer(canvas, sprite, action_data,
-                                           actual_action, frame_index,
-                                           center, center)
-        
-        # Crop to content
-        bbox = canvas.getbbox()
-        if bbox:
-            padding = 10
-            x1, y1, x2, y2 = bbox
-            x1 = max(0, x1 - padding)
-            y1 = max(0, y1 - padding)
-            x2 = min(canvas_size, x2 + padding)
-            y2 = min(canvas_size, y2 + padding)
-            canvas = canvas.crop((x1, y1, x2, y2))
-        
-        return canvas
+            # Load and draw head
+            head_path = self.get_head_path()
+            head_data = self.load_sprite(head_path)
+            
+            if head_data:
+                sprite, action_data = head_data
+                head_offset_x, head_offset_y = 0, 0
+                
+                if body_data:
+                    body_sprite, body_action = body_data
+                    body_act = body_action.get_action(actual_action)
+                    if body_act and body_act.get_frame_count() > 0:
+                        body_frame = body_act.get_frame(frame_index % body_act.get_frame_count())
+                        if body_frame and body_frame.anchors:
+                            anchor = body_frame.anchors[0]
+                            head_offset_x = anchor.x
+                            head_offset_y = anchor.y
+                
+                self._draw_sprite_layer(canvas, sprite, action_data,
+                                       actual_action, frame_index,
+                                       center + head_offset_x, 
+                                       center + head_offset_y)
+            
+            # Draw headgear
+            for hg_id in [self.headgear_low, self.headgear_mid, self.headgear_top]:
+                if hg_id > 0:
+                    hg_path = self.get_headgear_path(hg_id)
+                    hg_data = self.load_sprite(hg_path)
+                    if hg_data:
+                        sprite, action_data = hg_data
+                        self._draw_sprite_layer(canvas, sprite, action_data,
+                                               actual_action, frame_index,
+                                               center, center)
+            
+            # Crop to content
+            bbox = canvas.getbbox()
+            if bbox:
+                padding = 10
+                x1, y1, x2, y2 = bbox
+                x1 = max(0, x1 - padding)
+                y1 = max(0, y1 - padding)
+                x2 = min(canvas_size, x2 + padding)
+                y2 = min(canvas_size, y2 + padding)
+                canvas = canvas.crop((x1, y1, x2, y2))
+            
+            return canvas
+            
+        except Exception as e:
+            # Log error but don't spam console - only log detailed traceback for new errors
+            error_str = str(e)
+            if self._last_render_error != error_str:
+                import traceback
+                print(f"[ERROR] Failed to render frame: {e}")
+                traceback.print_exc()
+                self._last_render_error = error_str
+            return None
     
     def _draw_sprite_layer(self, canvas: Image.Image, 
                            sprite: SPRSprite, action_data: ACTData,
                            action_index: int, frame_index: int,
                            offset_x: int, offset_y: int):
         """Draw a sprite layer onto the canvas."""
+        # Validate action data has actions
+        if action_data.get_action_count() == 0:
+            return
+        
         action = action_data.get_action(action_index)
         if not action:
+            # Try modulo if action index out of range
             action = action_data.get_action(action_index % action_data.get_action_count())
         
         if not action:
             return
         
-        frame = action.get_frame(frame_index % action.get_frame_count())
+        # Validate action has frames (prevent ZeroDivisionError)
+        frame_count = action.get_frame_count()
+        if frame_count == 0:
+            return
+        
+        frame = action.get_frame(frame_index % frame_count)
         if not frame:
             return
         
@@ -964,6 +1101,9 @@ class CharacterDesignerWidget(QWidget):
         # Batch export
         self.batch_worker = None
         
+        # Error tracking for render errors (avoid spam)
+        self._last_render_error = None
+        
         # Build UI
         self._setup_ui()
         self._connect_signals()
@@ -1010,15 +1150,37 @@ class CharacterDesignerWidget(QWidget):
         
         # Resource Path
         path_group = QGroupBox("Resource Path")
-        path_layout = QHBoxLayout(path_group)
+        path_layout = QVBoxLayout(path_group)
         
+        path_input_layout = QHBoxLayout()
         self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText("Path to extracted RO data...")
-        path_layout.addWidget(self.path_edit)
+        self.path_edit.setPlaceholderText("Select extracted RO data folder or GRF file...")
+        path_input_layout.addWidget(self.path_edit)
         
         browse_btn = QPushButton("Browse")
         browse_btn.clicked.connect(self._on_browse_path)
-        path_layout.addWidget(browse_btn)
+        path_input_layout.addWidget(browse_btn)
+        
+        load_grf_btn = QPushButton("📦 Load GRF")
+        load_grf_btn.clicked.connect(self._on_load_grf)
+        path_input_layout.addWidget(load_grf_btn)
+        
+        path_layout.addLayout(path_input_layout)
+        
+        # Source indicator
+        self.source_label = QLabel("Source: Not set")
+        self.source_label.setStyleSheet("color: #888; font-style: italic;")
+        path_layout.addWidget(self.source_label)
+        
+        # Info label
+        info_text = QLabel(
+            "<small>💡 <b>Tip:</b> You can select either:<br/>"
+            "• An extracted RO data folder (traditional mode)<br/>"
+            "• A GRF file to read directly from archive (no extraction needed!)</small>"
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet("color: #666; padding: 5px;")
+        path_layout.addWidget(info_text)
         
         left_layout.addWidget(path_group)
         
@@ -1426,31 +1588,67 @@ class CharacterDesignerWidget(QWidget):
     
     def _on_browse_path(self):
         """Handle browse button click."""
-        path = QFileDialog.getExistingDirectory(
-            self, "Select Extracted RO Data Folder"
+        from PyQt6.QtWidgets import QMessageBox
+        
+        # Allow both folders and GRF files
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Extracted RO Data Folder or GRF File",
+            "", "GRF Files (*.grf *.gpf);;All Files (*.*)"
         )
-        if path:
-            # Auto-correct if user selected 'data' folder
-            if os.path.basename(path).lower() == 'data':
-                sprite_check = os.path.join(path, 'sprite')
-                if os.path.isdir(sprite_check):
-                    # Go up one level
-                    path = os.path.dirname(path)
-                    QMessageBox.information(self, "Path Corrected",
-                        f"Auto-corrected path to:\n{path}\n\n"
-                        "(You selected the 'data' folder - the path should be the parent folder)")
-            
+        
+        if not path:
+            # User cancelled, try folder selection
+            path = QFileDialog.getExistingDirectory(
+                self, "Select Extracted RO Data Folder"
+            )
+            if not path:
+                return
+        
+        # Set resource path (handles both GRF files and folders)
+        if self.compositor.set_resource_path(path):
             self.path_edit.setText(path)
-            self.compositor.set_resource_path(path)
             
-            # Verify the path structure
-            sprite_path = os.path.join(path, 'data', 'sprite')
-            if not os.path.isdir(sprite_path):
-                QMessageBox.warning(self, "Path Warning",
-                    f"Expected folder not found:\n{sprite_path}\n\n"
-                    "Make sure you selected the folder that CONTAINS the 'data' folder.")
+            # Update source indicator
+            if self.compositor.grf_vfs:
+                loaded_grfs = [os.path.basename(arch.grf_path) for arch in self.compositor.grf_vfs._archives]
+                self.source_label.setText(f"Source: GRF ({', '.join(loaded_grfs)})")
+                self.source_label.setStyleSheet("color: #4caf50; font-weight: bold;")
+            else:
+                self.source_label.setText(f"Source: Extracted Folder")
+                self.source_label.setStyleSheet("color: #2196f3; font-weight: bold;")
             
             self._on_render()
+    
+    def _on_load_grf(self):
+        """Handle Load GRF button click."""
+        from PyQt6.QtWidgets import QMessageBox
+        
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Load GRF File(s)",
+            "", "GRF Files (*.grf *.gpf);;All Files (*.*)"
+        )
+        
+        if not paths:
+            return
+        
+        # Sort: data.grf first, then rdata.grf, etc.
+        paths.sort(key=lambda x: (not 'data' in x.lower(), x.lower()))
+        
+        if self.compositor.set_grf_source(paths):
+            # Display first GRF path
+            self.path_edit.setText(paths[0])
+            
+            # Update source indicator
+            loaded_grfs = [os.path.basename(p) for p in paths]
+            self.source_label.setText(f"Source: GRF ({', '.join(loaded_grfs)})")
+            self.source_label.setStyleSheet("color: #4caf50; font-weight: bold;")
+            
+            QMessageBox.information(self, "Success", 
+                f"Loaded {len(paths)} GRF file(s):\n" + "\n".join(os.path.basename(p) for p in paths))
+            
+            self._on_render()
+        else:
+            QMessageBox.warning(self, "Error", "Failed to load GRF file(s)")
     
     def _on_character_changed(self):
         """Handle character setting changes."""
