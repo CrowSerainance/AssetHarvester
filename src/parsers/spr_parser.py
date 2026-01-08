@@ -406,6 +406,8 @@ class SPRParser:
         This is useful when reading sprites directly from GRF archives
         without extracting them to disk first.
         
+        Tries primary parser first, falls back to GRFEditor algorithm on failure.
+        
         Args:
             data: Raw SPR file bytes
             
@@ -416,6 +418,36 @@ class SPRParser:
             # Silently fail - might be incomplete data
             return None
         
+        # Try primary parser first
+        result = self._load_from_bytes_primary(data)
+        if result:
+            return result
+        
+        # Try GRFEditor fallback parser
+        try:
+            from src.parsers.spr_parser_fallback import parse_spr_fallback
+            result = parse_spr_fallback(data)
+            if result:
+                return result
+        except ImportError:
+            # Fallback not available - continue
+            pass
+        except Exception:
+            # Fallback failed - continue
+            pass
+        
+        return None
+    
+    def _load_from_bytes_primary(self, data: bytes) -> Optional[SPRSprite]:
+        """
+        Primary SPR parser (original implementation).
+        
+        Args:
+            data: Raw SPR file bytes
+            
+        Returns:
+            SPRSprite object if successful, None on error
+        """
         try:
             # Check signature
             if data[0:2] != SPR_SIGNATURE:

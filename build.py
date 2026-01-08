@@ -212,6 +212,8 @@ def run_pyinstaller(onefile: bool = False, noconsole: bool = False):
         'src.extractors.grf_extractor',
         'src.extractors.vfs_extractor',
         'src.extractors.generic_extractor',
+        'src.extractors.grf_decompression_fallback',  # GRFEditor fallback
+        'src.parsers.spr_parser_fallback',  # SPR fallback
     ]
     
     for imp in hidden_imports:

@@ -707,6 +707,39 @@ class GRFVirtualFileSystem:
         """
         Decompress zlib data with multiple fallback strategies.
         
+        First tries primary strategies, then falls back to GRFEditor algorithms.
+        """
+        # Try primary strategies first
+        result = self._decompress_zlib_primary(raw_data, entry)
+        if result:
+            return result
+        
+        # Try GRFEditor fallback strategies
+        try:
+            from src.extractors.grf_decompression_fallback import decompress_with_grfeditor_fallback
+            result = decompress_with_grfeditor_fallback(
+                raw_data,
+                entry.uncompressed_size,
+                entry.compression_type
+            )
+            if result:
+                self._stats['decompression_fallbacks'] += 1
+                return result
+        except ImportError:
+            # Fallback module not available - continue
+            pass
+        except Exception:
+            # Fallback failed - continue
+            pass
+        
+        # All strategies failed
+        self._stats['decompression_failures'] += 1
+        return None
+    
+    def _decompress_zlib_primary(self, raw_data: bytes, entry: GRFFileEntry) -> Optional[bytes]:
+        """
+        Decompress zlib data with multiple fallback strategies.
+        
         Handles:
         - Standard zlib compression
         - Raw deflate (no header)
