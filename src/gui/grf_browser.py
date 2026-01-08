@@ -37,11 +37,12 @@ except ImportError:
 
 # Try to import PIL for image preview
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw
     from PIL.ImageQt import ImageQt
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+    ImageDraw = None
 
 # Import GRF VFS
 try:
@@ -75,14 +76,27 @@ class GRFLoadingWorker(QThread):
         self.grf_path = grf_path
         self.vfs = vfs
         self.priority = priority
+        self._cancelled = False
+    
+    def cancel(self):
+        """Cancel the loading operation."""
+        self._cancelled = True
     
     def run(self):
         """Load GRF file in background thread."""
         try:
             self.progress.emit(0, 100, f"Loading GRF: {os.path.basename(self.grf_path)}")
             
+            if self._cancelled:
+                self.finished.emit(False, "Cancelled")
+                return
+            
             # Load GRF (this may take time for large files)
             success = self.vfs.load_grf(self.grf_path, self.priority)
+            
+            if self._cancelled:
+                self.finished.emit(False, "Cancelled")
+                return
             
             if success:
                 file_count = len(self.vfs._file_index)
@@ -94,6 +108,74 @@ class GRFLoadingWorker(QThread):
             import traceback
             traceback.print_exc()
             self.finished.emit(False, f"Error: {str(e)}")
+
+
+class GRFIndexingWorker(QThread):
+    """Worker thread for building GRF file index asynchronously."""
+    
+    progress = pyqtSignal(int, int, str)  # current, total, message
+    finished = pyqtSignal(bool, dict)  # success, index_data
+    
+    def __init__(self, archive: 'GRFArchive'):
+        super().__init__()
+        self.archive = archive
+        self._cancelled = False
+    
+    def cancel(self):
+        """Cancel the indexing operation."""
+        self._cancelled = True
+    
+    def run(self):
+        """Build file index in background thread."""
+        try:
+            # Get entries from archive
+            entries = list(self.archive.list_entries())
+            total = len(entries)
+            
+            if total == 0:
+                self.finished.emit(False, {})
+                return
+            
+            # Build index with progress updates
+            index = {}
+            processed = 0
+            progress_interval = max(1, total // 100)  # Update every 1%
+            
+            for entry in entries:
+                if self._cancelled:
+                    self.finished.emit(False, {})
+                    return
+                
+                try:
+                    normalized_path = entry.path
+                    # Higher priority overrides lower
+                    if normalized_path not in index:
+                        index[normalized_path] = entry
+                    elif entry.priority > index[normalized_path].priority:
+                        index[normalized_path] = entry
+                    
+                    processed += 1
+                    
+                    # Emit progress every N entries
+                    if processed % progress_interval == 0 or processed == total:
+                        percent = int((processed / total) * 100)
+                        self.progress.emit(processed, total, f"Indexing: {processed:,}/{total:,} files ({percent}%)")
+                        
+                except Exception as e:
+                    # Skip invalid entry
+                    continue
+            
+            if self._cancelled:
+                self.finished.emit(False, {})
+                return
+            
+            # Return index data for UI thread
+            self.finished.emit(True, index)
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.finished.emit(False, {})
 
 
 # ==============================================================================
@@ -118,7 +200,9 @@ class GRFBrowserWidget(QWidget):
         self.spr_parser = SPRParser() if PARSERS_AVAILABLE else None
         self.act_parser = ACTParser() if PARSERS_AVAILABLE else None
         self._loading_worker = None
+        self._indexing_worker = None
         self._tree_build_worker = None
+        self._current_archive = None  # Archive being indexed
         
         self._setup_ui()
     
@@ -230,7 +314,7 @@ class GRFBrowserWidget(QWidget):
     
     def load_grf(self, grf_path: str, priority: int = 0) -> bool:
         """
-        Load a GRF file (asynchronously).
+        Load a GRF file (asynchronously with background indexing).
         
         Args:
             grf_path: Path to GRF file
@@ -247,6 +331,15 @@ class GRFBrowserWidget(QWidget):
             QMessageBox.warning(self, "Error", f"GRF file not found: {grf_path}")
             return False
         
+        # Cancel any existing workers
+        if self._loading_worker and self._loading_worker.isRunning():
+            self._loading_worker.cancel()
+            self._loading_worker.wait(1000)  # Wait up to 1 second
+        
+        if self._indexing_worker and self._indexing_worker.isRunning():
+            self._indexing_worker.cancel()
+            self._indexing_worker.wait(1000)
+        
         # Create VFS if needed
         if self.vfs is None:
             self.vfs = GRFVirtualFileSystem(cache_size_mb=100)
@@ -254,30 +347,48 @@ class GRFBrowserWidget(QWidget):
         # Show loading UI
         self.loading_progress.setVisible(True)
         self.loading_progress.setRange(0, 0)  # Indeterminate
-        self.status_label.setText(f"Loading GRF: {os.path.basename(grf_path)}...")
+        self.status_label.setText(f"Opening GRF: {os.path.basename(grf_path)}...")
         
         # Disable buttons during loading
         for widget in self.findChildren(QPushButton):
             if widget.text() in ("📂 Load GRF...", "➕ Add GRF..."):
                 widget.setEnabled(False)
         
-        # Start async loading
-        self._loading_worker = GRFLoadingWorker(grf_path, self.vfs, priority)
-        self._loading_worker.progress.connect(self._on_loading_progress)
-        self._loading_worker.finished.connect(lambda success, msg: self._on_loading_finished(success, msg, grf_path))
-        self._loading_worker.start()
+        # Load GRF archive synchronously (quick - just opens file)
+        # Indexing will happen in background
+        from src.extractors.grf_vfs import GRFArchive
+        archive = GRFArchive(grf_path, priority)
+        if not archive.open():
+            QMessageBox.warning(self, "Error", f"Failed to open GRF file: {grf_path}")
+            self.loading_progress.setVisible(False)
+            for widget in self.findChildren(QPushButton):
+                if widget.text() in ("📂 Load GRF...", "➕ Add GRF..."):
+                    widget.setEnabled(True)
+            return False
+        
+        # Add to archives list
+        self.vfs._archives.append(archive)
+        self.vfs._archives.sort(key=lambda a: a.priority)
+        self._current_archive = archive
+        
+        # Start background indexing
+        self.status_label.setText(f"Indexing GRF: {os.path.basename(grf_path)}...")
+        self._indexing_worker = GRFIndexingWorker(archive)
+        self._indexing_worker.progress.connect(self._on_indexing_progress)
+        self._indexing_worker.finished.connect(lambda success, index: self._on_indexing_finished(success, index, grf_path, priority))
+        self._indexing_worker.start()
         
         return True
     
-    def _on_loading_progress(self, current: int, total: int, message: str):
-        """Handle loading progress update."""
+    def _on_indexing_progress(self, current: int, total: int, message: str):
+        """Handle indexing progress update."""
         if total > 0:
             self.loading_progress.setMaximum(total)
             self.loading_progress.setValue(current)
         self.status_label.setText(message)
     
-    def _on_loading_finished(self, success: bool, message: str, grf_path: str):
-        """Handle loading completion."""
+    def _on_indexing_finished(self, success: bool, index: dict, grf_path: str, priority: int):
+        """Handle indexing completion."""
         self.loading_progress.setVisible(False)
         
         # Re-enable buttons
@@ -285,21 +396,36 @@ class GRFBrowserWidget(QWidget):
             if widget.text() in ("📂 Load GRF...", "➕ Add GRF..."):
                 widget.setEnabled(True)
         
-        if success:
-            self.status_label.setText(message)
+        if success and index:
+            # Merge index into VFS
+            if self.vfs._file_index:
+                # Merge with existing index (higher priority overrides)
+                self.vfs.merge_file_index(index)
+            else:
+                # First GRF - set index directly
+                self.vfs.set_file_index(index)
+            
+            file_count = len(self.vfs._file_index)
+            self.status_label.setText(f"Loaded {file_count:,} files")
+            
             # Build tree incrementally (lazy loading)
             try:
                 self._build_tree_incremental()
                 self._update_status()
-                QMessageBox.information(self, "Success", f"Loaded: {os.path.basename(grf_path)}\n\n{message}")
+                QMessageBox.information(self, "Success", f"Loaded: {os.path.basename(grf_path)}\n\n{file_count:,} files indexed")
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 QMessageBox.critical(self, "Error", f"Failed to build directory tree:\n{e}")
                 self.status_label.setText(f"Error building tree: {e}")
         else:
-            self.status_label.setText(f"Failed: {message}")
-            QMessageBox.warning(self, "Error", f"Failed to load GRF:\n{message}")
+            self.status_label.setText(f"Failed to index GRF")
+            QMessageBox.warning(self, "Error", f"Failed to index GRF:\n{grf_path}\n\nThe file may be corrupted or inaccessible.")
+            # Remove archive if indexing failed
+            if self._current_archive and self._current_archive in self.vfs._archives:
+                self.vfs._archives.remove(self._current_archive)
+        
+        self._current_archive = None
     
     def _on_load_grf(self):
         """Handle Load GRF button click."""
@@ -325,9 +451,8 @@ class GRFBrowserWidget(QWidget):
             # Calculate priority (number of already loaded GRFs)
             priority = len(self.vfs._archives) if self.vfs else 0
             
-            if self.load_grf(path, priority=priority):
-                # Loading is async, message will be shown in _on_loading_finished
-                pass
+            # Load with background indexing (will merge with existing index)
+            self.load_grf(path, priority=priority)
     
     def _build_tree_incremental(self):
         """Build directory tree incrementally (only show top level first)."""
@@ -741,122 +866,385 @@ class GRFBrowserWidget(QWidget):
     
     def _preview_map_file(self, data: bytes, file_path: str, ext: str):
         """
-        Preview map file (.gat, .gnd, .rsw, .imf).
+        Preview map file (.gat, .gnd, .rsw, .imf) with visual rendering.
         
-        These files contain binary map data. We show basic info without
-        attempting to fully parse them, to avoid crashes on corrupted data.
+        Attempts to render a visual preview, falls back to text info if parsing fails.
         """
+        try:
+            # Try to render visual preview
+            rendered_img = self._render_map_preview(data, file_path, ext)
+            
+            if rendered_img and PIL_AVAILABLE:
+                # Display rendered image
+                self._display_image(rendered_img)
+                # Still update file info with metadata
+                self._update_map_file_info(data, file_path, ext)
+                return
+            
+            # Fall back to text preview if rendering failed
+            self._preview_map_file_text(data, file_path, ext)
+            
+        except Exception as e:
+            # Ultimate fallback - show error and text info
+            error_info = f"{ext.upper()} Preview Error:\n{str(e)}\n\n"
+            self.preview_label.setText(error_info)
+            self._preview_map_file_text(data, file_path, ext)
+    
+    def _preview_map_file_text(self, data: bytes, file_path: str, ext: str):
+        """Text-only preview fallback for map files."""
         try:
             info = f"{ext.upper().replace('.', '')} Map File\n\n"
             info += f"Size: {len(data):,} bytes\n"
             info += f"Path: {file_path}\n\n"
             
-            # Only attempt parsing if we have enough data
-            # Use very defensive parsing with multiple try/except blocks
+            # Parse header for basic info
+            import struct
             
-            if ext == '.gat':
-                info += "GAT: Ground Altitude Table (terrain walkability)\n"
-                if len(data) >= 14:
+            if ext == '.gat' and len(data) >= 14:
+                magic = data[0:4]
+                if magic == b'GRAT':
                     try:
-                        import struct
-                        # GAT format: magic (4), version (2 bytes), width (4), height (4)
-                        magic = data[0:4]
-                        if magic == b'GRAT':
-                            try:
-                                version = struct.unpack('<H', data[4:6])[0]
-                                width = struct.unpack('<I', data[6:10])[0]
-                                height = struct.unpack('<I', data[10:14])[0]
-                                # Sanity check dimensions
-                                if 0 < width < 10000 and 0 < height < 10000:
-                                    info += f"\nVersion: {version}\n"
-                                    info += f"Map Size: {width} x {height} cells\n"
-                                    info += f"Total Cells: {width * height:,}\n"
-                                else:
-                                    info += "\n(Dimensions out of range - may be corrupted)\n"
-                            except struct.error:
-                                info += "\n(Header parse error)\n"
-                        else:
-                            # Try legacy format (no magic)
-                            try:
-                                width = struct.unpack('<I', data[0:4])[0]
-                                height = struct.unpack('<I', data[4:8])[0]
-                                if 0 < width < 10000 and 0 < height < 10000:
-                                    info += f"\nMap Size: {width} x {height} cells (legacy format)\n"
-                                else:
-                                    info += "\n(Invalid format or corrupted)\n"
-                            except struct.error:
-                                info += f"\n(Non-standard format: {magic})\n"
-                    except Exception as e:
-                        info += f"\n(Parse error: {e})\n"
+                        version = struct.unpack('<H', data[4:6])[0]
+                        width = struct.unpack('<I', data[6:10])[0]
+                        height = struct.unpack('<I', data[10:14])[0]
+                        if 0 < width < 10000 and 0 < height < 10000:
+                            info += f"Version: {version}\n"
+                            info += f"Map Size: {width} x {height} cells\n"
+                            info += f"Total Cells: {width * height:,}\n"
+                    except struct.error:
+                        pass
                 else:
-                    info += "\n(File too small to parse)\n"
+                    try:
+                        width = struct.unpack('<I', data[0:4])[0]
+                        height = struct.unpack('<I', data[4:8])[0]
+                        if 0 < width < 10000 and 0 < height < 10000:
+                            info += f"Map Size: {width} x {height} cells (legacy)\n"
+                    except struct.error:
+                        pass
+                info += "\nGAT: Ground Altitude Table (terrain walkability)"
+                        
+            elif ext == '.gnd' and len(data) >= 10:
+                magic = data[0:4]
+                if magic == b'GRGN':
+                    try:
+                        version = struct.unpack('<H', data[4:6])[0]
+                        info += f"Version: {version}\n"
+                    except struct.error:
+                        pass
+                info += "\nGND: Ground mesh data (textures, surfaces)"
                     
-            elif ext == '.gnd':
-                info += "GND: Ground mesh data (textures, surfaces)\n"
-                if len(data) >= 10:
+            elif ext == '.rsw' and len(data) >= 8:
+                magic = data[0:4]
+                if magic == b'GRSW':
                     try:
-                        import struct
-                        magic = data[0:4]
-                        if magic == b'GRGN':
-                            try:
-                                version = struct.unpack('<H', data[4:6])[0]
-                                info += f"\nVersion: {version}\n"
-                            except struct.error:
-                                info += "\n(Version parse error)\n"
-                        else:
-                            info += f"\n(Format: {magic.hex() if magic else 'unknown'})\n"
-                    except Exception as e:
-                        info += f"\n(Parse error: {e})\n"
-                else:
-                    info += "\n(File too small to parse)\n"
-                    
-            elif ext == '.rsw':
-                info += "RSW: Resource World (map objects, lighting, sounds)\n"
-                if len(data) >= 8:
-                    try:
-                        import struct
-                        magic = data[0:4]
-                        if magic == b'GRSW':
-                            try:
-                                version = struct.unpack('<H', data[4:6])[0]
-                                info += f"\nVersion: {version}\n"
-                                info += "Contains: Objects, Lights, Sounds, Effects\n"
-                            except struct.error:
-                                info += "\n(Version parse error)\n"
-                        else:
-                            info += f"\n(Format: {magic.hex() if magic else 'unknown'})\n"
-                    except Exception as e:
-                        info += f"\n(Parse error: {e})\n"
-                else:
-                    info += "\n(File too small to parse)\n"
+                        version = struct.unpack('<H', data[4:6])[0]
+                        info += f"Version: {version}\n"
+                        info += "Contains: Objects, Lights, Sounds, Effects\n"
+                    except struct.error:
+                        pass
+                info += "\nRSW: Resource World (map objects, lighting, sounds)"
                         
             elif ext == '.imf':
-                info += "IMF: Interface Motion File (UI animations)\n"
-                if len(data) >= 4:
-                    try:
-                        # IMF has various formats, just show basic info
-                        info += f"\nData preview available via hex view\n"
-                    except Exception as e:
-                        info += f"\n(Parse error: {e})\n"
+                info += "\nIMF: Interface Motion File (UI animations)\n"
+                info += "Data preview available via hex view"
             
-            else:
-                info += f"\nUnrecognized map format: {ext}\n"
-            
-            # Always show hex preview option
             info += "\n\n[Right-click → View Hex Dump for raw data]"
             
             self.preview_label.setText(info)
             self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             
         except Exception as e:
-            # Ultimate fallback - show error and hex dump
-            error_info = f"{ext.upper()} Preview Error:\n{str(e)}\n\n"
-            error_info += "Showing hex dump instead:\n\n"
-            self.preview_label.setText(error_info)
+            self.preview_label.setText(f"{ext.upper()} Text Preview Error:\n{str(e)}")
+    
+    def _update_map_file_info(self, data: bytes, file_path: str, ext: str):
+        """Update file info panel with map file metadata."""
+        try:
+            import struct
+            entry = self.vfs.get_file_info(file_path)
+            if entry:
+                info = self.file_info.text()
+                info += f"\n\n{ext.upper()} Map Data:"
+                
+                if ext == '.gat' and len(data) >= 14:
+                    magic = data[0:4]
+                    if magic == b'GRAT':
+                        try:
+                            version = struct.unpack('<H', data[4:6])[0]
+                            width = struct.unpack('<I', data[6:10])[0]
+                            height = struct.unpack('<I', data[10:14])[0]
+                            if 0 < width < 10000 and 0 < height < 10000:
+                                info += f"\n{width}x{height} cells"
+                        except:
+                            pass
+                
+                self.file_info.setText(info)
+        except:
+            pass  # Ignore errors in metadata update
+    
+    def _render_map_preview(self, data: bytes, file_path: str, ext: str) -> Optional[Image.Image]:
+        """
+        Render visual preview for map files.
+        
+        Args:
+            data: Raw map file bytes
+            file_path: File path
+            ext: File extension (.gat, .gnd, .rsw, .imf)
+            
+        Returns:
+            PIL Image if successful, None otherwise
+        """
+        if not PIL_AVAILABLE:
+            return None
+        
+        try:
+            import struct
+            
+            if ext == '.gat':
+                return self._render_gat_preview(data)
+            elif ext == '.gnd':
+                return self._render_gnd_preview(data)
+            elif ext == '.rsw':
+                return self._render_rsw_preview(data)
+            elif ext == '.imf':
+                return self._render_imf_preview(data)
+            
+            return None
+            
+        except Exception as e:
+            # Silently fail - will fall back to text preview
+            return None
+    
+    def _render_gat_preview(self, data: bytes) -> Optional[Image.Image]:
+        """
+        Render GAT (Ground Altitude Table) as walkability/height map.
+        
+        GAT format:
+        - Header: magic (4), version (2), width (4), height (4)
+        - Cells: Each cell is 20 bytes: 4 floats (heights at corners), 4 uints (flags)
+        """
+        try:
+            import struct
+            
+            if len(data) < 14:
+                return None
+            
+            # Parse header
+            magic = data[0:4]
+            offset = 14 if magic == b'GRAT' else 0
+            
+            if offset == 0:
+                # Legacy format - no magic, just width/height
+                if len(data) < 8:
+                    return None
+                try:
+                    width = struct.unpack('<I', data[0:4])[0]
+                    height = struct.unpack('<I', data[4:8])[0]
+                    offset = 8
+                except struct.error:
+                    return None
+            else:
+                try:
+                    width = struct.unpack('<I', data[6:10])[0]
+                    height = struct.unpack('<I', data[10:14])[0]
+                except struct.error:
+                    return None
+            
+            # Validate dimensions
+            if width <= 0 or height <= 0 or width > 1000 or height > 1000:
+                # Too large for preview, or invalid
+                return None
+            
+            # Each cell is 20 bytes (4 floats + 4 uints)
+            cell_size = 20
+            expected_size = offset + (width * height * cell_size)
+            
+            if len(data) < expected_size:
+                # Data truncated, but try to render what we have
+                available_cells = (len(data) - offset) // cell_size
+                if available_cells == 0:
+                    return None
+            
+            # Create preview image (limit to 512x512 for performance)
+            preview_scale = min(1.0, 512.0 / max(width, height))
+            img_width = max(1, int(width * preview_scale))
+            img_height = max(1, int(height * preview_scale))
+            
+            img = Image.new('RGB', (img_width, img_height), color=(128, 128, 128))
+            pixels = img.load()
+            
+            # Sample cells for preview (every Nth cell based on scale)
+            cell_stride = max(1, int(1.0 / preview_scale))
+            
+            for y in range(0, height, cell_stride):
+                for x in range(0, width, cell_stride):
+                    cell_offset = offset + (y * width + x) * cell_size
+                    
+                    if cell_offset + 20 > len(data):
+                        continue
+                    
+                    try:
+                        # Read heights at 4 corners (float32 each)
+                        h1 = struct.unpack('<f', data[cell_offset:cell_offset+4])[0]
+                        h2 = struct.unpack('<f', data[cell_offset+4:cell_offset+8])[0]
+                        h3 = struct.unpack('<f', data[cell_offset+8:cell_offset+12])[0]
+                        h4 = struct.unpack('<f', data[cell_offset+12:cell_offset+16])[0]
+                        
+                        # Read walkability flags (4 bytes)
+                        flags = struct.unpack('<I', data[cell_offset+16:cell_offset+20])[0]
+                        
+                        # Average height for visualization
+                        avg_height = (h1 + h2 + h3 + h4) / 4.0
+                        
+                        # Normalize height to 0-255 range (assuming reasonable terrain heights)
+                        # Ragnarok maps typically range from -100 to 100
+                        height_normalized = max(0, min(255, int((avg_height + 100) * 255 / 200)))
+                        
+                        # Check walkability (bit 0 = walkable)
+                        walkable = (flags & 0x01) != 0
+                        
+                        # Color: green for walkable, red for unwalkable, brightness = height
+                        if walkable:
+                            r = 0
+                            g = height_normalized
+                            b = 0
+                        else:
+                            r = height_normalized
+                            g = 0
+                            b = 0
+                        
+                        # Draw pixel(s) in preview
+                        px = int(x * preview_scale)
+                        py = int(y * preview_scale)
+                        
+                        if px < img_width and py < img_height:
+                            pixels[px, py] = (r, g, b)
+                            
+                            # Fill surrounding pixels if downscaled
+                            for dy in range(max(0, py-1), min(img_height, py+2)):
+                                for dx in range(max(0, px-1), min(img_width, px+2)):
+                                    pixels[dx, dy] = (r, g, b)
+                                    
+                    except (struct.error, ValueError, IndexError):
+                        continue
+            
+            return img
+            
+        except Exception:
+            return None
+    
+    def _render_gnd_preview(self, data: bytes) -> Optional[Image.Image]:
+        """
+        Render GND (Ground) as texture/height approximation.
+        
+        GND format is complex, we'll just show a basic visualization.
+        """
+        try:
+            if len(data) < 20:
+                return None
+            
+            import struct
+            
+            magic = data[0:4]
+            if magic != b'GRGN':
+                return None
+            
+            # GND has version, dimensions, and texture data
+            # Simplified: create a colored placeholder showing we have GND data
+            # In a full implementation, you'd parse the actual texture/height data
+            
+            # Create a simple colored rectangle as placeholder
+            img = Image.new('RGB', (400, 300), color=(100, 150, 100))
+            
+            # Draw some pattern to indicate it's GND data
+            if ImageDraw:
+                draw = ImageDraw.Draw(img)
+            else:
+                return img
+            
+            # Draw grid pattern
+            for i in range(0, 400, 20):
+                draw.line([(i, 0), (i, 300)], fill=(80, 120, 80), width=1)
+            for i in range(0, 300, 20):
+                draw.line([(0, i), (400, i)], fill=(80, 120, 80), width=1)
+            
+            # Add label
+            draw.text((10, 10), "GND Ground Mesh", fill=(255, 255, 255))
+            draw.text((10, 30), "(Texture/Heightmap data)", fill=(200, 200, 200))
+            
+            return img
+            
+        except Exception:
+            return None
+    
+    def _render_rsw_preview(self, data: bytes) -> Optional[Image.Image]:
+        """
+        Render RSW (Resource World) showing object placements or map bounds.
+        
+        RSW contains map metadata, objects, lights, etc.
+        We'll create a simple visualization.
+        """
+        try:
+            if len(data) < 20:
+                return None
+            
+            import struct
+            
+            magic = data[0:4]
+            if magic != b'GRSW':
+                return None
+            
+            # Create a simple visualization
+            img = Image.new('RGB', (400, 300), color=(50, 50, 80))
+            
+            if not ImageDraw:
+                return img
+            
+            draw = ImageDraw.Draw(img)
+            
+            # Draw map bounds representation
+            bounds_color = (100, 150, 255)
+            draw.rectangle([50, 50, 350, 250], outline=bounds_color, width=2)
+            
+            # Try to extract basic info and show as text
             try:
-                self._preview_hex(data)
+                version = struct.unpack('<H', data[4:6])[0]
+                draw.text((60, 60), f"RSW Version {version}", fill=(255, 255, 255))
+                draw.text((60, 80), "Map Objects & Lighting", fill=(200, 200, 200))
             except:
-                self.preview_label.setText(f"Hex view also failed:\n{str(e)}")
+                draw.text((60, 60), "RSW Resource World", fill=(255, 255, 255))
+            
+            # Draw some placeholder "objects" as dots
+            for x, y in [(150, 120), (200, 150), (250, 180), (180, 200)]:
+                draw.ellipse([x-5, y-5, x+5, y+5], fill=(255, 200, 100))
+            
+            return img
+            
+        except Exception:
+            return None
+    
+    def _render_imf_preview(self, data: bytes) -> Optional[Image.Image]:
+        """
+        Render IMF (Interface Motion File) as a placeholder.
+        
+        IMF files are UI animations - we'll show a simple placeholder.
+        """
+        try:
+            # Create placeholder image
+            img = Image.new('RGB', (300, 200), color=(60, 60, 60))
+            
+            if not ImageDraw:
+                return img
+            
+            draw = ImageDraw.Draw(img)
+            
+            draw.text((20, 20), "IMF Interface Motion", fill=(255, 255, 255))
+            draw.text((20, 45), "UI Animation File", fill=(200, 200, 200))
+            draw.text((20, 70), "(Preview not available)", fill=(150, 150, 150))
+            
+            return img
+            
+        except Exception:
+            return None
     
     def _preview_hex(self, data: bytes):
         """Preview file as hex dump."""

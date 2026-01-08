@@ -419,13 +419,14 @@ class GRFVirtualFileSystem:
             'decompression_fallbacks': 0
         }
     
-    def load_grf(self, grf_path: str, priority: int = 0) -> bool:
+    def load_grf(self, grf_path: str, priority: int = 0, rebuild_index: bool = True) -> bool:
         """
         Load a GRF file into the virtual file system.
         
         Args:
             grf_path: Path to GRF file
             priority: Priority level (higher priority overrides lower for duplicate files)
+            rebuild_index: If True, rebuild unified index immediately (False for async indexing)
             
         Returns:
             True if successful, False otherwise
@@ -443,11 +444,35 @@ class GRFVirtualFileSystem:
         self._archives.append(archive)
         self._archives.sort(key=lambda a: a.priority)
         
-        # Rebuild unified index (higher priority overrides)
-        self._rebuild_index()
+        # Rebuild unified index if requested (higher priority overrides)
+        if rebuild_index:
+            self._rebuild_index()
         
         print(f"[INFO] Loaded GRF: {os.path.basename(grf_path)} (priority {priority}, {len(archive._entries)} files)")
         return True
+    
+    def set_file_index(self, new_index: dict):
+        """
+        Set the file index (thread-safe - call from UI thread after background indexing).
+        
+        Args:
+            new_index: New file index dictionary
+        """
+        self._file_index = new_index
+    
+    def merge_file_index(self, new_index: dict):
+        """
+        Merge a new index into the existing one (for adding GRFs).
+        
+        Args:
+            new_index: New file index dictionary to merge
+        """
+        for path, entry in new_index.items():
+            # Higher priority overrides lower
+            if path not in self._file_index:
+                self._file_index[path] = entry
+            elif entry.priority > self._file_index[path].priority:
+                self._file_index[path] = entry
     
     def _rebuild_index(self):
         """Rebuild unified file index from all archives."""
