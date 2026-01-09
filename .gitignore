@@ -46,3 +46,21 @@ nul
 # Reference code (not included in repo)
 GRFEditor-main/
 ActEditor-main/
+
+
+# Claude
+.claude/
+.claude-cache/
+.claude-history/
+.claude-logs/
+.claude-sessions/
+.claude-temp/
+.claude-temp-files/
+.claude-temp-files-2/
+.claude-temp-files-3/
+.claude-temp-files-4/
+.claude-temp-files-5/
+.claude-temp-files-6/
+.claude-temp-files-7/
+.claude-temp-files-8/
+.claude-temp-files-9/

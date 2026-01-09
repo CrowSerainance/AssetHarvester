@@ -110,12 +110,301 @@ class GRFLoadingWorker(QThread):
             self.finished.emit(False, f"Error: {str(e)}")
 
 
+class PreviewWorker(QThread):
+    """Worker thread for loading and rendering file previews asynchronously."""
+
+    # Emit image as bytes + size tuple to avoid cross-thread PIL/Qt issues
+    preview_ready = pyqtSignal(bytes, int, int, str, str)  # image_bytes, width, height, info_text, file_path
+    preview_text = pyqtSignal(str, str, str)  # text_content, info_text, file_path
+    error = pyqtSignal(str, str)  # error_message, file_path
+
+    def __init__(self, vfs, file_path: str, spr_parser=None, act_parser=None, debug_mode: bool = False):
+        super().__init__()
+        self.vfs = vfs
+        self.file_path = file_path
+        self.spr_parser = spr_parser
+        self.act_parser = act_parser
+        self.debug_mode = debug_mode
+        self._cancelled = False
+
+    def cancel(self):
+        """Cancel the preview operation."""
+        self._cancelled = True
+
+    def _emit_image(self, img, info_text: str):
+        """Convert PIL image to bytes and emit signal (thread-safe)."""
+        if self._cancelled:
+            return
+        try:
+            # Convert to RGBA if needed
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+            # Get raw bytes - this is thread-safe
+            img_bytes = img.tobytes()
+            width, height = img.size
+            self.preview_ready.emit(img_bytes, width, height, info_text, self.file_path)
+        except Exception as e:
+            self.error.emit(f"Failed to convert image: {e}", self.file_path)
+
+    def run(self):
+        """Load and render preview in background thread."""
+        if self._cancelled:
+            return
+
+        try:
+            # Get file info
+            entry = self.vfs.get_file_info(self.file_path)
+            if not entry:
+                self.error.emit("File not found in GRF index", self.file_path)
+                return
+
+            if self._cancelled:
+                return
+
+            # Read file data
+            data = self.vfs.read_file(self.file_path)
+            if not data:
+                self.error.emit("Failed to read/decompress file\n\n(File may be corrupted or use unsupported compression)", self.file_path)
+                return
+
+            if self._cancelled:
+                return
+
+            # Build file info text
+            ext = os.path.splitext(self.file_path)[1].lower()
+            info_text = f"File: {entry.original_path}\n"
+            info_text += f"Size: {entry.uncompressed_size:,} bytes\n"
+            info_text += f"Compressed: {entry.compressed_size:,} bytes\n"
+            info_text += f"Source: {os.path.basename(entry.grf_path)}\n"
+            info_text += f"Type: {ext if ext else '(no extension)'}\n"
+            info_text += f"Compression: {entry.compression_type}\n"
+            info_text += f"Encrypted: {'Yes' if entry.is_encrypted() else 'No'}"
+
+            if self._cancelled:
+                return
+
+            # Process based on file type
+            if ext == '.spr' and PIL_AVAILABLE and self.spr_parser:
+                self._process_spr(data, info_text)
+            elif ext == '.act' and PARSERS_AVAILABLE and self.act_parser:
+                self._process_act(data, info_text)
+            elif ext in ('.bmp', '.jpg', '.jpeg', '.png', '.tga') and PIL_AVAILABLE:
+                self._process_image(data, info_text)
+            elif ext in ('.txt', '.xml', '.lua', '.lub', '.dat', '.ini', '.cfg'):
+                self._process_text(data, info_text)
+            else:
+                # Unknown type - show hex
+                self._process_hex(data, info_text)
+
+        except Exception as e:
+            if not self._cancelled:
+                import traceback
+                error_msg = f"Error loading file:\n{str(e)}"
+                if self.debug_mode:
+                    error_msg += f"\n\n{traceback.format_exc()}"
+                self.error.emit(error_msg, self.file_path)
+
+    def _process_spr(self, data: bytes, info_text: str):
+        """Process SPR sprite file - shows STATIC frame preview."""
+        if self._cancelled:
+            return
+
+        try:
+            sprite = self.spr_parser.load_from_bytes(data)
+
+            if self._cancelled:
+                return
+
+            if sprite is None:
+                error_msg = "❌ SPR Parse Failed\n\nThe SPR file could not be parsed."
+                self.preview_text.emit(error_msg, info_text, self.file_path)
+                return
+
+            total_frames = sprite.get_total_frames()
+            if total_frames == 0:
+                error_msg = "❌ SPR has 0 frames"
+                self.preview_text.emit(error_msg, info_text, self.file_path)
+                return
+
+            if self._cancelled:
+                return
+
+            # Render first frame
+            img = sprite.get_frame_image(0)
+
+            if self._cancelled:
+                return
+
+            if img:
+                # Add sprite details to info
+                info_text += f"\n\n📊 SPR Details:\n"
+                info_text += f"Total Frames: {sprite.get_total_frames()}\n"
+                info_text += f"Indexed: {sprite.get_indexed_count()}\n"
+                info_text += f"RGBA: {sprite.get_rgba_count()}\n"
+                info_text += f"\n💡 Note: SPR files contain STATIC frames.\n"
+                info_text += f"For animation, view the matching .act file."
+                self._emit_image(img, info_text)
+            else:
+                error_msg = f"SPR: {total_frames} frames\n⚠️ Image rendering failed\n\n"
+                error_msg += "The sprite was parsed but the frame could not be rendered."
+                self.preview_text.emit(error_msg, info_text, self.file_path)
+
+        except Exception as e:
+            if not self._cancelled:
+                import traceback
+                error_msg = f"❌ SPR Preview Error:\n{str(e)}"
+                if self.debug_mode:
+                    error_msg += f"\n\n{traceback.format_exc()}"
+                self.preview_text.emit(error_msg, info_text, self.file_path)
+
+    def _process_act(self, data: bytes, info_text: str):
+        """Process ACT action file."""
+        if self._cancelled:
+            return
+
+        try:
+            act = self.act_parser.load_from_bytes(data)
+
+            if self._cancelled:
+                return
+
+            if act is None:
+                error_msg = "❌ ACT Parse Failed"
+                self.preview_text.emit(error_msg, info_text, self.file_path)
+                return
+
+            # Try to load matching SPR file
+            spr_path = self.file_path.replace('.act', '.spr')
+
+            if self._cancelled:
+                return
+
+            if self.vfs.file_exists(spr_path) and self.spr_parser:
+                spr_data = self.vfs.read_file(spr_path)
+
+                if self._cancelled:
+                    return
+
+                if spr_data:
+                    sprite = self.spr_parser.load_from_bytes(spr_data)
+
+                    if self._cancelled:
+                        return
+
+                    if sprite and sprite.get_total_frames() > 0:
+                        # Find first action with frames
+                        for i in range(act.get_action_count()):
+                            if self._cancelled:
+                                return
+
+                            action = act.get_action(i)
+                            if action and action.get_frame_count() > 0:
+                                frame = action.get_frame(0)
+                                if frame and len(frame.layers) > 0:
+                                    layer = frame.layers[0]
+                                    sprite_idx = layer.sprite_index
+
+                                    if sprite_idx >= 0:
+                                        if layer.sprite_type == 1:
+                                            sprite_idx += sprite.get_indexed_count()
+
+                                        if sprite_idx < sprite.get_total_frames():
+                                            if self._cancelled:
+                                                return
+
+                                            img = sprite.get_frame_image(sprite_idx)
+
+                                            if self._cancelled:
+                                                return
+
+                                            if img:
+                                                info_text += f"\n\nACT Details:\n"
+                                                info_text += f"Actions: {act.get_action_count()}\n"
+                                                info_text += f"Events: {len(act.events)}\n"
+                                                info_text += f"Action {i}: {action.get_frame_count()} frames, {len(frame.layers)} layers"
+                                                self._emit_image(img, info_text)
+                                                return
+                                break
+
+            # Fallback to text info
+            info = f"ACT Version: {act.version}\n"
+            info += f"Actions: {act.get_action_count()}\n"
+            info += f"Events: {len(act.events)}"
+            self.preview_text.emit(info, info_text, self.file_path)
+
+        except Exception as e:
+            if not self._cancelled:
+                error_msg = f"❌ ACT Preview Error:\n{str(e)}"
+                self.preview_text.emit(error_msg, info_text, self.file_path)
+
+    def _process_image(self, data: bytes, info_text: str):
+        """Process image file."""
+        if self._cancelled:
+            return
+
+        try:
+            img = Image.open(io.BytesIO(data))
+            if not self._cancelled:
+                self._emit_image(img, info_text)
+        except Exception as e:
+            if not self._cancelled:
+                self.preview_text.emit(f"Image Preview Error: {e}", info_text, self.file_path)
+
+    def _process_text(self, data: bytes, info_text: str):
+        """Process text file."""
+        if self._cancelled:
+            return
+
+        try:
+            for encoding in ['utf-8', 'euc-kr', 'latin-1']:
+                try:
+                    text = data.decode(encoding)
+                    if len(text) > 10000:
+                        text = text[:10000] + "\n\n... (truncated)"
+                    if not self._cancelled:
+                        self.preview_text.emit(text, info_text, self.file_path)
+                    return
+                except UnicodeDecodeError:
+                    continue
+
+            # Fallback to hex
+            self._process_hex(data, info_text)
+        except Exception as e:
+            if not self._cancelled:
+                self.preview_text.emit(f"Text Preview Error: {e}", info_text, self.file_path)
+
+    def _process_hex(self, data: bytes, info_text: str):
+        """Process as hex dump."""
+        if self._cancelled:
+            return
+
+        try:
+            preview_size = min(256, len(data))
+            preview_data = data[:preview_size]
+
+            hex_lines = []
+            for i in range(0, preview_size, 16):
+                chunk = preview_data[i:i+16]
+                hex_str = ' '.join(f'{b:02x}' for b in chunk)
+                ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                hex_lines.append(f"{i:04x}: {hex_str:<48} {ascii_str}")
+
+            if len(data) > preview_size:
+                hex_lines.append(f"\n... ({len(data) - preview_size:,} more bytes)")
+
+            if not self._cancelled:
+                self.preview_text.emit('\n'.join(hex_lines), info_text, self.file_path)
+        except Exception as e:
+            if not self._cancelled:
+                self.preview_text.emit(f"Hex view error: {e}", info_text, self.file_path)
+
+
 class GRFIndexingWorker(QThread):
     """Worker thread for building GRF file index asynchronously."""
-    
+
     progress = pyqtSignal(int, int, str)  # current, total, message
     finished = pyqtSignal(bool, dict)  # success, index_data
-    
+
     def __init__(self, archive: 'GRFArchive'):
         super().__init__()
         self.archive = archive
@@ -202,8 +491,21 @@ class GRFBrowserWidget(QWidget):
         self._loading_worker = None
         self._indexing_worker = None
         self._tree_build_worker = None
+        self._preview_worker = None  # Worker for async preview loading
         self._current_archive = None  # Archive being indexed
         self._debug_mode = False  # Debug mode for showing parse failures
+        
+        # Check for NumPy availability and warn if missing
+        try:
+            import numpy
+            self._numpy_available = True
+        except ImportError:
+            self._numpy_available = False
+            print("=" * 60)
+            print("[PERFORMANCE WARNING] NumPy is NOT installed!")
+            print("SPR preview will be VERY SLOW without NumPy.")
+            print("Install with: pip install numpy")
+            print("=" * 60)
         
         self._setup_ui()
         
@@ -660,18 +962,30 @@ class GRFBrowserWidget(QWidget):
     
     def _on_file_selection_changed(self):
         """Handle file list selection change."""
+        # Cancel any running preview worker immediately
+        self._cancel_preview_worker()
+
         selected = self.file_list.selectedItems()
         if not selected:
             self.preview_label.setText("No file selected")
             self.file_info.setText("")
             return
-        
+
         item = selected[0]
         file_path = item.data(Qt.ItemDataRole.UserRole)
-        
+
         if file_path:
             self._preview_file(file_path)
             self.file_selected.emit(file_path)
+
+    def _cancel_preview_worker(self):
+        """Cancel any running preview worker."""
+        if self._preview_worker is not None:
+            if self._preview_worker.isRunning():
+                self._preview_worker.cancel()
+                self._preview_worker.quit()
+                self._preview_worker.wait(100)  # Brief wait
+            self._preview_worker = None
     
     def _on_file_double_clicked(self, item: QListWidgetItem):
         """Handle file double-click."""
@@ -680,10 +994,96 @@ class GRFBrowserWidget(QWidget):
             self._preview_file(file_path)
     
     def _preview_file(self, file_path: str):
-        """Preview a file with full error handling."""
+        """Preview a file with async loading for heavy files (SPR/ACT)."""
         if not self.vfs:
             return
-        
+
+        # Store current file path
+        self._current_file_path = file_path
+
+        # Check file extension
+        ext = os.path.splitext(file_path)[1].lower()
+
+        # For SPR/ACT files, use async worker to avoid blocking GUI
+        if ext in ('.spr', '.act'):
+            self._preview_file_async(file_path)
+            return
+
+        # For other file types, use sync preview (they're fast enough)
+        self._preview_file_sync(file_path)
+
+    def _preview_file_async(self, file_path: str):
+        """Preview file using async worker thread (for heavy files like SPR/ACT)."""
+        # Cancel any existing preview worker
+        self._cancel_preview_worker()
+
+        # Show loading indicator
+        self.preview_label.setText("Loading preview...")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.file_info.setText("Loading...")
+
+        # Create and start preview worker
+        self._preview_worker = PreviewWorker(
+            self.vfs,
+            file_path,
+            self.spr_parser,
+            self.act_parser,
+            self._debug_mode
+        )
+        self._preview_worker.preview_ready.connect(self._on_preview_ready)
+        self._preview_worker.preview_text.connect(self._on_preview_text)
+        self._preview_worker.error.connect(self._on_preview_error)
+        self._preview_worker.start()
+
+    def _on_preview_ready(self, img_bytes: bytes, width: int, height: int, info_text: str, file_path: str):
+        """Handle preview image ready from worker."""
+        # Only update if this is still the current file
+        if file_path != self._current_file_path:
+            return
+
+        try:
+            # Reconstruct QImage from raw bytes (thread-safe)
+            qimg = QImage(img_bytes, width, height, width * 4, QImage.Format.Format_RGBA8888)
+            # Make a copy since the original bytes might go out of scope
+            qimg = qimg.copy()
+            pixmap = QPixmap.fromImage(qimg)
+
+            # Scale if too large
+            max_size = 800
+            if pixmap.width() > max_size or pixmap.height() > max_size:
+                pixmap = pixmap.scaled(max_size, max_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+            self.preview_label.setPixmap(pixmap)
+            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.file_info.setText(info_text)
+        except Exception as e:
+            self.preview_label.setText(f"Failed to display image: {e}")
+
+    def _on_preview_text(self, text: str, info_text: str, file_path: str):
+        """Handle preview text ready from worker."""
+        # Only update if this is still the current file
+        if file_path != self._current_file_path:
+            return
+
+        self.preview_label.setText(text)
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.file_info.setText(info_text)
+
+    def _on_preview_error(self, error_msg: str, file_path: str):
+        """Handle preview error from worker."""
+        # Only update if this is still the current file
+        if file_path != self._current_file_path:
+            return
+
+        self.preview_label.setText(error_msg)
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.file_info.setText("Error - see preview for details")
+
+    def _preview_file_sync(self, file_path: str):
+        """Preview a file synchronously (for fast file types)."""
+        if not self.vfs:
+            return
+
         try:
             # Get file info
             entry = self.vfs.get_file_info(file_path)
@@ -691,7 +1091,7 @@ class GRFBrowserWidget(QWidget):
                 self.preview_label.setText("File not found in GRF index")
                 self.file_info.setText("")
                 return
-            
+
             # Read file data
             data = self.vfs.read_file(file_path)
             if not data:
@@ -708,7 +1108,7 @@ class GRFBrowserWidget(QWidget):
                 info_text += "\n⚠️ Decompression failed"
                 self.file_info.setText(info_text)
                 return
-            
+
             # Update file info
             ext = os.path.splitext(file_path)[1].lower()
             info_text = f"File: {entry.original_path}\n"
@@ -719,17 +1119,10 @@ class GRFBrowserWidget(QWidget):
             info_text += f"Compression: {entry.compression_type}\n"
             info_text += f"Encrypted: {'Yes' if entry.is_encrypted() else 'No'}"
             self.file_info.setText(info_text)
-            
-            # Store current file path
-            self._current_file_path = file_path
-            
+
             # Preview based on file type - with individual error handling
             try:
-                if ext == '.spr' and PIL_AVAILABLE and self.spr_parser:
-                    self._preview_spr(data, file_path)
-                elif ext == '.act' and PARSERS_AVAILABLE and self.act_parser:
-                    self._preview_act(data, file_path)
-                elif ext in ('.bmp', '.jpg', '.jpeg', '.png', '.tga') and PIL_AVAILABLE:
+                if ext in ('.bmp', '.jpg', '.jpeg', '.png', '.tga') and PIL_AVAILABLE:
                     self._preview_image(data)
                 elif ext in ('.txt', '.xml', '.lua', '.lub', '.dat', '.ini', '.cfg'):
                     self._preview_text(data)
@@ -749,7 +1142,7 @@ class GRFBrowserWidget(QWidget):
                     self._preview_hex(data)
                 except:
                     self.preview_label.setText(f"Hex view also failed:\n{str(preview_error)}")
-                
+
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
@@ -757,28 +1150,42 @@ class GRFBrowserWidget(QWidget):
             self.file_info.setText("Error - see preview for details")
     
     def _preview_spr(self, data: bytes, file_path: str = ""):
-        """Preview SPR sprite file with enhanced error handling."""
+        """Preview SPR sprite file with timeout protection and progress feedback."""
+        # Show loading indicator immediately
+        self.preview_label.setText("Loading SPR preview...")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        QApplication.processEvents()  # Force UI update
+        
         # Check PIL availability
         if not PIL_AVAILABLE:
             error_msg = "⚠️ Pillow (PIL) not installed\n\n"
             error_msg += "Image preview is disabled.\n"
-            error_msg += "Install Pillow with: pip install Pillow\n\n"
-            error_msg += "Showing hex dump instead:"
+            error_msg += "Install Pillow with: pip install Pillow"
             self.preview_label.setText(error_msg)
             self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-            self._preview_hex(data)
             return
-        
+
         if not self.spr_parser:
-            error_msg = "⚠️ SPR Parser not available\n\n"
-            error_msg += "SPR parsing is disabled.\n\n"
-            error_msg += "Showing hex dump instead:"
+            error_msg = "⚠️ SPR Parser not available"
             self.preview_label.setText(error_msg)
-            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-            self._preview_hex(data)
             return
-        
+
         try:
+            # Quick validation before parsing
+            if len(data) < 8:
+                self.preview_label.setText("❌ SPR file too small (< 8 bytes)")
+                return
+            
+            # Check signature
+            if data[0:2] != b'SP':
+                self.preview_label.setText(f"❌ Invalid SPR signature: {data[0:2]}")
+                self._preview_hex(data)
+                return
+            
+            # Parse SPR
+            self.preview_label.setText("Parsing SPR structure...")
+            QApplication.processEvents()
+            
             sprite = self.spr_parser.load_from_bytes(data)
             
             # Handle parse failure
@@ -788,15 +1195,8 @@ class GRFBrowserWidget(QWidget):
                 error_msg += "Possible reasons:\n"
                 error_msg += "  • File is corrupted\n"
                 error_msg += "  • Invalid format or version\n"
-                error_msg += "  • Data is truncated or incomplete\n"
-                
-                if self._debug_mode:
-                    import traceback
-                    error_msg += f"\n\nDebug Info:\n{traceback.format_exc()}"
-                else:
-                    error_msg += "\n\n(Enable debug mode to see detailed error)"
-                
-                error_msg += "\n\nShowing hex dump:"
+                error_msg += "  • Data is truncated\n\n"
+                error_msg += "Showing hex dump:"
                 self.preview_label.setText(error_msg)
                 self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
                 self._preview_hex(data)
@@ -819,6 +1219,10 @@ class GRFBrowserWidget(QWidget):
                 self._preview_hex(data)
                 return
             
+            # Update status before rendering (rendering can be slow without numpy)
+            self.preview_label.setText(f"Rendering frame 1/{total_frames}...")
+            QApplication.processEvents()
+            
             # Try to render first frame
             try:
                 img = sprite.get_frame_image(0)
@@ -826,24 +1230,29 @@ class GRFBrowserWidget(QWidget):
                     self._display_image(img)
                     # Update file info with sprite details
                     info = self.file_info.text()
-                    info += f"\n\nSPR Details:\nFrames: {sprite.get_total_frames()}\n"
+                    info += f"\n\nSPR Details:\n"
+                    info += f"Frames: {total_frames}\n"
                     info += f"Indexed: {sprite.get_indexed_count()}\n"
                     info += f"RGBA: {sprite.get_rgba_count()}"
+                    if total_frames > 0:
+                        frame = sprite.get_frame(0)
+                        if frame:
+                            info += f"\nFrame 0: {frame.width}x{frame.height}"
                     self.file_info.setText(info)
                     return
                 else:
                     error_msg = f"SPR: {total_frames} frames\n"
-                    error_msg += "⚠️ Image rendering failed\n"
-                    error_msg += "(Frame 0 could not be converted to image)"
+                    error_msg += "⚠️ Frame rendering returned None\n"
+                    error_msg += "(Frame may be empty or corrupted)"
                     self.preview_label.setText(error_msg)
-                    self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+                    
             except Exception as img_error:
                 error_msg = f"SPR: {total_frames} frames\n"
-                error_msg += f"⚠️ Failed to render frame 0: {str(img_error)}\n\n"
-                error_msg += "Showing hex dump:"
+                error_msg += f"⚠️ Render error: {str(img_error)[:100]}"
                 self.preview_label.setText(error_msg)
-                self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-                self._preview_hex(data)
+                if self._debug_mode:
+                    import traceback
+                    print(f"[DEBUG] SPR render error: {traceback.format_exc()}")
                 
         except Exception as e:
             import traceback

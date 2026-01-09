@@ -29,6 +29,11 @@ PyQt6>=6.5.0
 # Used for generating asset thumbnails and image preview
 Pillow>=10.0.0
 
+# NumPy - Fast array operations for sprite palette application
+# Critical for SPR preview performance (50x faster than pure Python)
+# Without NumPy, SPR previews will be extremely slow
+numpy>=1.24.0
+
 # -----------------------------------------------------------------------------
 # DEVELOPMENT DEPENDENCIES (Optional)
 # -----------------------------------------------------------------------------

@@ -557,7 +557,7 @@ class ACTParser:
     def _read_action(self, data: bytes, offset: int, 
                      version: Tuple[int, int]) -> Tuple[ACTAction, int]:
         """
-        Read a single action from ACT data.
+        Read a single action from ACT data with safety limits.
         
         Args:
             data: Full ACT file data
@@ -576,25 +576,23 @@ class ACTParser:
         frame_count = struct.unpack('<I', data[offset:offset + 4])[0]
         offset += 4
         
-        # Validate frame count (reasonable max: ~100 frames per action)
-        if frame_count > 100:
-            raise ValueError(f"Invalid frame count: {frame_count} (max expected: 100)")
+        # CRITICAL: Validate frame count to prevent infinite loops
+        # Reasonable max: ~100 frames per action for RO sprites
+        if frame_count > 200:
+            raise ValueError(f"Invalid frame count: {frame_count} (max: 200)")
         if frame_count == 0xFFFFFFFF or frame_count > 0x7FFFFFFF:
-            raise ValueError(f"Invalid frame count (likely corruption): {frame_count}")
+            raise ValueError(f"Corrupted frame count: {frame_count}")
         
-        # Parse each frame
+        # Parse each frame with progress check
         for i in range(frame_count):
             if offset >= len(data):
-                # Silently stop - truncated data
+                # Data truncated - return what we have
                 break
             try:
                 frame, offset = self._read_frame(data, offset, version)
                 action.frames.append(frame)
             except (struct.error, ValueError) as e:
-                # Stop parsing on corruption - don't spam errors
-                break
-            except Exception as e:
-                # Unexpected error - stop parsing
+                # Stop on error - don't continue with corrupted data
                 break
         
         return action, offset

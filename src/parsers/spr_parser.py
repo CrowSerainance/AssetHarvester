@@ -1,83 +1,38 @@
 # ==============================================================================
-# SPR PARSER MODULE
+# SPR PARSER MODULE - OPTIMIZED VERSION
 # ==============================================================================
 # Parser for Ragnarok Online SPR (Sprite) files.
-#
-# SPR files contain 2D sprite images used for characters, monsters, items,
-# and effects in Ragnarok Online. The format supports:
-#
-#   - Indexed color images (256 colors using a palette)
-#   - RGBA images (32-bit true color, added in later versions)
-#   - Multiple frames per sprite file
-#   - RLE compression for indexed images
-#
-# File Format Versions:
-#   - Version 1.0: Basic indexed sprites
-#   - Version 1.1: Added RLE compression for indexed sprites
-#   - Version 2.0: Added RGBA sprite support
-#   - Version 2.1: Current version with both indexed and RGBA
-#
-# References:
-#   - https://ragnarokresearchlab.github.io/file-formats/spr/
-#   - https://github.com/vthibault/roBrowser
-#   - https://github.com/zhad3/zrenderer
-#
-# Usage Example:
-#   parser = SPRParser()
-#   sprite = parser.load("data/sprite/npc/merchant.spr")
-#   
-#   # Get a specific frame as a PIL Image
-#   image = sprite.get_frame_image(0)
-#   image.save("frame_0.png")
-#   
-#   # Apply a custom palette
-#   sprite.set_palette(custom_palette_data)
-#   recolored = sprite.get_frame_image(0)
+# SPR files contain STATIC FRAMES. For animations, use ACT files.
 # ==============================================================================
 
 import struct
-from typing import List, Optional, Tuple, BinaryIO
+from typing import List, Optional, Tuple
 from dataclasses import dataclass, field
 
 # ==============================================================================
-# Try to import PIL/Pillow for image handling
-# If not available, the parser will still work but image conversion won't
+# Import dependencies
 # ==============================================================================
 try:
     from PIL import Image
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
-    print("[WARN] Pillow not installed. Image conversion disabled.")
-    print("       Install with: pip install Pillow")
 
-# Try to import numpy for faster image processing
 try:
     import numpy as np
     NUMPY_AVAILABLE = True
 except ImportError:
     NUMPY_AVAILABLE = False
 
-
 # ==============================================================================
 # CONSTANTS
 # ==============================================================================
 
-# SPR file signature (first 2 bytes)
 SPR_SIGNATURE = b"SP"
+SPR_VERSION_1_1 = (1, 1)
+SPR_VERSION_2_0 = (2, 0)
 
-# SPR version constants
-# Version is stored as two bytes: minor, major
-# So version 2.1 is stored as bytes [1, 2]
-SPR_VERSION_1_0 = (1, 0)  # Basic indexed sprites
-SPR_VERSION_1_1 = (1, 1)  # Added RLE compression
-SPR_VERSION_2_0 = (2, 0)  # Added RGBA support
-SPR_VERSION_2_1 = (2, 1)  # Current version
-
-# Default palette (grayscale)
-# Used when no palette is embedded in the file
-# Creates 256 RGBA colors where each color is (i, i, i, 255) for grayscale
-# 256 colors * 4 bytes (RGBA) = 1024 bytes total
+# Default grayscale palette
 DEFAULT_PALETTE = bytes([val for i in range(256) for val in (i, i, i, 255)])
 
 
@@ -87,65 +42,20 @@ DEFAULT_PALETTE = bytes([val for i in range(256) for val in (i, i, i, 255)])
 
 @dataclass
 class SPRFrame:
-    """
-    Represents a single frame/image in an SPR file.
-    
-    Each frame can be either:
-    - Indexed: 8-bit pixels referencing a 256-color palette
-    - RGBA: 32-bit true color pixels (red, green, blue, alpha)
-    
-    Attributes:
-        width (int):       Width of the frame in pixels
-        height (int):      Height of the frame in pixels
-        frame_type (str):  Either "indexed" or "rgba"
-        data (bytes):      Raw pixel data
-                          - For indexed: 1 byte per pixel (palette index)
-                          - For RGBA: 4 bytes per pixel (R, G, B, A)
-    """
     width: int = 0
     height: int = 0
-    frame_type: str = "indexed"  # "indexed" or "rgba"
+    frame_type: str = "indexed"
     data: bytes = b""
     
-    def get_size(self) -> Tuple[int, int]:
-        """
-        Get frame dimensions.
-        
-        Returns:
-            Tuple of (width, height)
-        """
-        return (self.width, self.height)
-    
     def is_indexed(self) -> bool:
-        """Check if this frame uses indexed color."""
         return self.frame_type == "indexed"
     
     def is_rgba(self) -> bool:
-        """Check if this frame uses RGBA color."""
         return self.frame_type == "rgba"
 
 
-@dataclass
+@dataclass  
 class SPRSprite:
-    """
-    Represents a complete SPR sprite file.
-    
-    An SPR file contains multiple frames that can be used in animations.
-    Character sprites typically have frames for different directions and
-    actions (standing, walking, attacking, etc.).
-    
-    Attributes:
-        version (tuple):       SPR format version as (major, minor)
-        indexed_frames (list): List of indexed color frames
-        rgba_frames (list):    List of RGBA color frames
-        palette (bytes):       256-color palette (1024 bytes: 256 * RGBA)
-        filepath (str):        Original file path (for reference)
-    
-    Frame Indexing:
-        - Indexed frames come first, numbered 0 to (indexed_count - 1)
-        - RGBA frames come after, numbered indexed_count to (total - 1)
-        - Use get_frame() with the global index to get any frame
-    """
     version: Tuple[int, int] = (2, 1)
     indexed_frames: List[SPRFrame] = field(default_factory=list)
     rgba_frames: List[SPRFrame] = field(default_factory=list)
@@ -153,331 +63,157 @@ class SPRSprite:
     filepath: str = ""
     
     def get_total_frames(self) -> int:
-        """
-        Get total number of frames (indexed + RGBA).
-        
-        Returns:
-            Total frame count
-        """
         return len(self.indexed_frames) + len(self.rgba_frames)
     
     def get_indexed_count(self) -> int:
-        """Get number of indexed color frames."""
         return len(self.indexed_frames)
     
     def get_rgba_count(self) -> int:
-        """Get number of RGBA color frames."""
         return len(self.rgba_frames)
     
     def get_frame(self, index: int) -> Optional[SPRFrame]:
-        """
-        Get a frame by global index.
-        
-        The global index spans both indexed and RGBA frames:
-        - Index 0 to (indexed_count - 1): Indexed frames
-        - Index indexed_count to (total - 1): RGBA frames
-        
-        Args:
-            index: Global frame index
-            
-        Returns:
-            SPRFrame if valid index, None otherwise
-        """
-        indexed_count = len(self.indexed_frames)
-        
+        ic = len(self.indexed_frames)
         if index < 0:
             return None
-        elif index < indexed_count:
+        elif index < ic:
             return self.indexed_frames[index]
-        elif index < indexed_count + len(self.rgba_frames):
-            return self.rgba_frames[index - indexed_count]
-        else:
-            return None
+        elif index < ic + len(self.rgba_frames):
+            return self.rgba_frames[index - ic]
+        return None
     
     def set_palette(self, palette_data: bytes):
-        """
-        Set a custom palette for indexed frames.
-        
-        This allows recoloring sprites (e.g., hair dyes, class palettes).
-        The palette should be 1024 bytes (256 colors * 4 bytes RGBA each).
-        
-        Args:
-            palette_data: Raw palette bytes (1024 bytes expected)
-        """
-        if len(palette_data) >= 1024:
-            self.palette = palette_data[:1024]
-        else:
-            # Pad with zeros if too short
-            self.palette = palette_data + b'\x00' * (1024 - len(palette_data))
+        self.palette = (palette_data[:1024] if len(palette_data) >= 1024 
+                       else palette_data + b'\x00' * (1024 - len(palette_data)))
     
     def get_frame_image(self, index: int) -> Optional['Image.Image']:
-        """
-        Convert a frame to a PIL Image.
-
-        This applies the palette to indexed frames and handles transparency.
-        Index 0 in the palette is treated as transparent (RO convention).
-
-        Performance: Uses numpy for ~50x faster palette application when available.
-
-        Args:
-            index: Global frame index
-
-        Returns:
-            PIL Image in RGBA mode, or None if PIL unavailable or invalid index
-        """
+        """Convert frame to PIL Image."""
         if not PIL_AVAILABLE:
-            print("[ERROR] Pillow required for image conversion")
             return None
-
+        
         frame = self.get_frame(index)
-        if frame is None:
+        if not frame or frame.width <= 0 or frame.height <= 0:
             return None
-
-        if frame.width == 0 or frame.height == 0:
-            # Empty frame, return 1x1 transparent image
-            return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-
-        if frame.is_rgba():
-            # RGBA frame - direct conversion
-            try:
-                img = Image.frombytes("RGBA", (frame.width, frame.height), frame.data)
-                r, g, b, a = img.split()
-                img = Image.merge("RGBA", (r, g, b, a))
-                return img
-            except Exception as e:
-                print(f"[ERROR] Failed to convert RGBA frame: {e}")
-                return None
-
-        else:
-            # Indexed frame - apply palette
-            palette = self.palette if self.palette else DEFAULT_PALETTE
-
-            # Use numpy for much faster palette application (~50x speedup)
-            if NUMPY_AVAILABLE:
-                return self._apply_palette_numpy(frame, palette)
+        
+        # Size limit: max 1000x1000
+        if frame.width > 1000 or frame.height > 1000:
+            return Image.new("RGBA", (100, 100), (80, 80, 80, 255))
+        
+        try:
+            if frame.is_rgba():
+                return self._render_rgba(frame)
             else:
-                return self._apply_palette_pure_python(frame, palette)
-
-    def _apply_palette_numpy(self, frame: 'SPRFrame', palette: bytes) -> Optional['Image.Image']:
-        """
-        Apply palette using numpy - very fast vectorized operation.
-
-        Args:
-            frame: The indexed SPR frame
-            palette: 1024-byte palette data
-
-        Returns:
-            PIL Image in RGBA mode
-        """
-        try:
-            # Convert frame data to numpy array of indices
-            indices = np.frombuffer(frame.data, dtype=np.uint8)
-
-            # Ensure correct size
-            expected_size = frame.width * frame.height
-            if len(indices) < expected_size:
-                indices = np.pad(indices, (0, expected_size - len(indices)), 'constant')
-            elif len(indices) > expected_size:
-                indices = indices[:expected_size]
-
-            # Convert palette to numpy array (256 colors x 4 channels)
-            pal_array = np.frombuffer(palette, dtype=np.uint8).reshape(256, 4)
-
-            # Vectorized lookup - apply palette to all pixels at once
-            rgba_flat = pal_array[indices]
-
-            # Set alpha=0 for index 0 (transparent)
-            rgba_flat[indices == 0, 3] = 0
-
-            # Reshape to image dimensions
-            rgba_image = rgba_flat.reshape(frame.height, frame.width, 4)
-
-            # Convert to PIL Image
-            return Image.fromarray(rgba_image, 'RGBA')
-
+                return self._render_indexed(frame)
         except Exception as e:
-            print(f"[ERROR] Numpy palette conversion failed: {e}")
-            return self._apply_palette_pure_python(frame, palette)
-
-    def _apply_palette_pure_python(self, frame: 'SPRFrame', palette: bytes) -> Optional['Image.Image']:
-        """
-        Apply palette using pure Python - slower fallback.
-
-        Args:
-            frame: The indexed SPR frame
-            palette: 1024-byte palette data
-
-        Returns:
-            PIL Image in RGBA mode
-        """
-        try:
-            # Pre-build lookup table for palette (faster than per-pixel lookup)
-            pal_lookup = []
-            for i in range(256):
-                offset = i * 4
-                if offset + 4 <= len(palette):
-                    r, g, b, a = palette[offset:offset + 4]
-                    # Index 0 is transparent
-                    if i == 0:
-                        a = 0
-                    pal_lookup.append((r, g, b, a))
-                else:
-                    pal_lookup.append((0, 0, 0, 0))
-
-            # Create output buffer
-            pixels = bytearray(frame.width * frame.height * 4)
-
-            # Apply palette using pre-built lookup
-            for i, color_idx in enumerate(frame.data[:frame.width * frame.height]):
-                color = pal_lookup[color_idx]
-                offset = i * 4
-                pixels[offset:offset + 4] = color
-
-            # Create image from buffer
-            return Image.frombytes("RGBA", (frame.width, frame.height), bytes(pixels))
-
-        except Exception as e:
-            print(f"[ERROR] Failed to convert indexed frame: {e}")
+            print(f"[ERROR] Render failed: {e}")
             return None
+
+    def _render_rgba(self, frame: SPRFrame) -> Optional['Image.Image']:
+        """Render RGBA frame (stored as ABGR in RO)."""
+        size = frame.width * frame.height * 4
+        data = frame.data[:size] if len(frame.data) >= size else frame.data + b'\x00' * (size - len(frame.data))
+        
+        if NUMPY_AVAILABLE:
+            try:
+                # Fast: frombuffer + copy gives writable array
+                arr = np.frombuffer(data, dtype=np.uint8).copy()
+                arr = arr.reshape((frame.height, frame.width, 4))
+                # ABGR -> RGBA: just rearrange columns
+                rgba = arr[:, :, [3, 2, 1, 0]]  # R=3, G=2, B=1, A=0
+                return Image.fromarray(rgba, 'RGBA')
+            except:
+                pass  # Fall through to pure Python
+        
+        # Pure Python: use struct.unpack for speed
+        pixels = bytearray(size)
+        for i in range(0, size, 4):
+            pixels[i] = data[i + 3]      # R
+            pixels[i + 1] = data[i + 2]  # G
+            pixels[i + 2] = data[i + 1]  # B
+            pixels[i + 3] = data[i]      # A
+        return Image.frombytes("RGBA", (frame.width, frame.height), bytes(pixels))
+
+    def _render_indexed(self, frame: SPRFrame) -> Optional['Image.Image']:
+        """Render indexed frame with palette."""
+        size = frame.width * frame.height
+        pal = self.palette if len(self.palette) >= 1024 else DEFAULT_PALETTE
+        data = frame.data[:size] if len(frame.data) >= size else frame.data + b'\x00' * (size - len(frame.data))
+        
+        if NUMPY_AVAILABLE:
+            try:
+                # Create palette array (256 colors, RGBA)
+                pal_arr = np.frombuffer(pal[:1024], dtype=np.uint8).copy().reshape(256, 4)
+                
+                # Create index array
+                idx = np.frombuffer(data, dtype=np.uint8).copy()
+                
+                # Lookup
+                rgba = pal_arr[idx]
+                
+                # Index 0 = transparent
+                rgba[idx == 0, 3] = 0
+                
+                # Reshape and create image
+                rgba = rgba.reshape((frame.height, frame.width, 4))
+                return Image.fromarray(rgba, 'RGBA')
+            except:
+                pass  # Fall through to pure Python
+        
+        # Pure Python: pre-build lookup table
+        lut = []
+        for i in range(256):
+            o = i * 4
+            r, g, b, a = pal[o], pal[o+1], pal[o+2], (0 if i == 0 else pal[o+3])
+            lut.append(bytes([r, g, b, a]))
+        
+        # Fast join
+        pixels = b''.join(lut[b] for b in data)
+        return Image.frombytes("RGBA", (frame.width, frame.height), pixels)
 
 
 # ==============================================================================
-# SPR PARSER CLASS
+# SPR PARSER
 # ==============================================================================
 
 class SPRParser:
-    """
-    Parser for Ragnarok Online SPR sprite files.
-    
-    This class handles reading and decoding SPR files, including:
-    - Version detection and handling
-    - RLE decompression for indexed frames
-    - Palette extraction
-    - Both indexed and RGBA frame types
-    
-    Usage:
-        parser = SPRParser()
-        
-        # Load from file path
-        sprite = parser.load("path/to/sprite.spr")
-        
-        # Or load from bytes
-        sprite = parser.load_from_bytes(spr_data)
-        
-        # Access frames
-        frame = sprite.get_frame(0)
-        image = sprite.get_frame_image(0)
-    """
-    
-    def __init__(self):
-        """Initialize the SPR parser."""
-        pass
-    
     def load(self, filepath: str) -> Optional[SPRSprite]:
-        """
-        Load an SPR file from disk.
-        
-        Args:
-            filepath: Path to the .spr file
-            
-        Returns:
-            SPRSprite object if successful, None on error
-        """
         try:
             with open(filepath, 'rb') as f:
                 data = f.read()
-            
             sprite = self.load_from_bytes(data)
             if sprite:
                 sprite.filepath = filepath
             return sprite
-            
-        except FileNotFoundError:
-            print(f"[ERROR] SPR file not found: {filepath}")
-            return None
-        except Exception as e:
-            print(f"[ERROR] Failed to load SPR {filepath}: {e}")
+        except:
             return None
     
     def load_from_bytes(self, data: bytes) -> Optional[SPRSprite]:
-        """
-        Load an SPR sprite from raw bytes with full error handling.
-        
-        This is useful when reading sprites directly from GRF archives
-        without extracting them to disk first.
-        
-        Tries primary parser first, falls back to GRFEditor algorithm on failure.
-        
-        Args:
-            data: Raw SPR file bytes
-            
-        Returns:
-            SPRSprite object if successful, None on error
-        """
         if not data or len(data) < 8:
-            # Silently fail - might be incomplete data
             return None
         
-        # Try primary parser first
-        result = self._load_from_bytes_primary(data)
+        result = self._parse(data)
         if result:
             return result
         
-        # Try GRFEditor fallback parser
+        # Fallback
         try:
             from src.parsers.spr_parser_fallback import parse_spr_fallback
-            result = parse_spr_fallback(data)
-            if result:
-                return result
-        except ImportError:
-            # Fallback not available - continue
-            pass
-        except Exception:
-            # Fallback failed - continue
-            pass
-        
-        return None
+            return parse_spr_fallback(data)
+        except:
+            return None
     
-    def _load_from_bytes_primary(self, data: bytes) -> Optional[SPRSprite]:
-        """
-        Primary SPR parser (original implementation).
-        
-        Args:
-            data: Raw SPR file bytes
-            
-        Returns:
-            SPRSprite object if successful, None on error
-        """
+    def _parse(self, data: bytes) -> Optional[SPRSprite]:
         try:
-            # Check signature
             if data[0:2] != SPR_SIGNATURE:
-                # Silently fail - might be wrong file type
                 return None
             
-            # Read version (minor byte, major byte)
-            version_minor = data[2]
-            version_major = data[3]
-            version = (version_major, version_minor)
-            
-            # Validate version (reasonable range: 1.0 to 3.0)
-            if version_major < 1 or version_major > 3:
-                # Invalid version - might be corrupted data
+            version = (data[3], data[2])
+            if version[0] < 1 or version[0] > 3:
                 return None
             
-            # Create sprite object
             sprite = SPRSprite(version=version)
             
-            # Read frame counts
-            # Offset 4-5: indexed frame count (uint16)
-            # Offset 6-7: rgba frame count (uint16) - only in version >= 2.0
-            if len(data) < 6:
-                return None
-            
             indexed_count = struct.unpack('<H', data[4:6])[0]
-            
-            # Validate frame count (max reasonable is ~1000 frames per sprite)
             if indexed_count > 1000:
-                # Suspiciously large - likely corrupted
                 return None
             
             rgba_count = 0
@@ -487,259 +223,104 @@ class SPRParser:
                 if len(data) < 8:
                     return None
                 rgba_count = struct.unpack('<H', data[6:8])[0]
-                # Validate RGBA frame count
                 if rgba_count > 1000:
                     return None
                 offset = 8
             
-            # Read indexed frames
-            for i in range(indexed_count):
-                if offset >= len(data):
-                    break  # Truncated data
-                try:
-                    frame, offset = self._read_indexed_frame(data, offset, version)
-                    sprite.indexed_frames.append(frame)
-                except (struct.error, ValueError, IndexError):
-                    # Skip corrupted frame
+            # Indexed frames
+            for _ in range(indexed_count):
+                if offset + 4 > len(data):
                     break
+                f, offset = self._read_indexed(data, offset, version)
+                if f:
+                    sprite.indexed_frames.append(f)
             
-            # Read RGBA frames
-            for i in range(rgba_count):
-                if offset >= len(data):
-                    break  # Truncated data
-                try:
-                    frame, offset = self._read_rgba_frame(data, offset)
-                    sprite.rgba_frames.append(frame)
-                except (struct.error, ValueError, IndexError):
-                    # Skip corrupted frame
+            # RGBA frames
+            for _ in range(rgba_count):
+                if offset + 4 > len(data):
                     break
+                f, offset = self._read_rgba(data, offset)
+                if f:
+                    sprite.rgba_frames.append(f)
             
-            # Read palette (at the end of file, 1024 bytes)
-            # Palette is present in all versions
+            # Palette
             if offset + 1024 <= len(data):
                 sprite.palette = data[offset:offset + 1024]
             else:
-                # Use default grayscale palette
                 sprite.palette = DEFAULT_PALETTE
             
-            # Validate we got at least one frame
-            if sprite.get_total_frames() == 0:
-                return None
-            
-            return sprite
-            
-        except (struct.error, ValueError, IndexError) as e:
-            # Silently fail - corrupted data
-            return None
-        except Exception as e:
-            # Log unexpected errors
-            print(f"[ERROR] SPR parse failed: {e}")
+            return sprite if sprite.get_total_frames() > 0 else None
+        except:
             return None
     
-    def _read_indexed_frame(self, data: bytes, offset: int, 
-                           version: Tuple[int, int]) -> Tuple[SPRFrame, int]:
-        """
-        Read an indexed color frame from SPR data.
-        
-        Indexed frames can be either raw or RLE compressed depending on version.
-        
-        Args:
-            data: Full SPR file data
-            offset: Current read position
-            version: SPR file version
-            
-        Returns:
-            Tuple of (SPRFrame, new_offset)
-        """
-        # Read width and height (uint16 each)
-        width = struct.unpack('<H', data[offset:offset + 2])[0]
-        height = struct.unpack('<H', data[offset + 2:offset + 4])[0]
+    def _read_indexed(self, data: bytes, offset: int, version):
+        w = struct.unpack('<H', data[offset:offset+2])[0]
+        h = struct.unpack('<H', data[offset+2:offset+4])[0]
         offset += 4
         
-        frame = SPRFrame(
-            width=width,
-            height=height,
-            frame_type="indexed"
-        )
+        frame = SPRFrame(width=w, height=h, frame_type="indexed")
         
-        if width == 0 or height == 0:
-            # Empty frame
-            frame.data = b""
+        if w == 0 or h == 0:
             return frame, offset
         
-        # Version 1.1+ uses RLE compression for indexed frames
         if version >= SPR_VERSION_1_1:
-            # Read compressed size (uint16)
-            compressed_size = struct.unpack('<H', data[offset:offset + 2])[0]
+            # RLE
+            if offset + 2 > len(data):
+                return frame, offset
+            csize = struct.unpack('<H', data[offset:offset+2])[0]
             offset += 2
-            
-            # Read compressed data
-            compressed_data = data[offset:offset + compressed_size]
-            offset += compressed_size
-            
-            # Decompress RLE
-            frame.data = self._decompress_rle(compressed_data, width * height)
+            cdata = data[offset:offset+csize]
+            offset += csize
+            frame.data = self._decompress_rle(cdata, w * h)
         else:
-            # Raw pixel data
-            pixel_count = width * height
-            frame.data = data[offset:offset + pixel_count]
-            offset += pixel_count
+            pc = w * h
+            frame.data = data[offset:offset+pc]
+            offset += pc
         
         return frame, offset
     
-    def _read_rgba_frame(self, data: bytes, offset: int) -> Tuple[SPRFrame, int]:
-        """
-        Read an RGBA color frame from SPR data.
-        
-        RGBA frames are stored uncompressed as raw pixel data.
-        Each pixel is 4 bytes (Red, Green, Blue, Alpha).
-        
-        Args:
-            data: Full SPR file data
-            offset: Current read position
-            
-        Returns:
-            Tuple of (SPRFrame, new_offset)
-        """
-        # Read width and height (uint16 each)
-        width = struct.unpack('<H', data[offset:offset + 2])[0]
-        height = struct.unpack('<H', data[offset + 2:offset + 4])[0]
+    def _read_rgba(self, data: bytes, offset: int):
+        w = struct.unpack('<H', data[offset:offset+2])[0]
+        h = struct.unpack('<H', data[offset+2:offset+4])[0]
         offset += 4
         
-        frame = SPRFrame(
-            width=width,
-            height=height,
-            frame_type="rgba"
-        )
+        frame = SPRFrame(width=w, height=h, frame_type="rgba")
         
-        if width == 0 or height == 0:
-            frame.data = b""
+        if w == 0 or h == 0:
             return frame, offset
         
-        # RGBA data: 4 bytes per pixel
-        pixel_count = width * height * 4
-        frame.data = data[offset:offset + pixel_count]
-        offset += pixel_count
+        pc = w * h * 4
+        frame.data = data[offset:offset+pc]
+        offset += pc
         
         return frame, offset
     
-    def _decompress_rle(self, compressed: bytes, expected_size: int) -> bytes:
-        """
-        Decompress RLE-encoded indexed frame data.
-        
-        RO uses a simple RLE scheme:
-        - If a byte is 0x00, the next byte is a run length of zeros
-        - Otherwise, the byte is a literal pixel value
-        
-        Args:
-            compressed: RLE-compressed data
-            expected_size: Expected decompressed size (width * height)
-            
-        Returns:
-            Decompressed pixel data
-        """
+    def _decompress_rle(self, compressed: bytes, expected: int) -> bytes:
         result = bytearray()
         i = 0
-        
-        while i < len(compressed) and len(result) < expected_size:
-            byte = compressed[i]
+        while i < len(compressed) and len(result) < expected:
+            b = compressed[i]
             i += 1
-            
-            if byte == 0:
-                # Run of zeros
-                if i < len(compressed):
-                    run_length = compressed[i]
-                    i += 1
-                    result.extend([0] * run_length)
+            if b == 0 and i < len(compressed):
+                run = compressed[i]
+                i += 1
+                result.extend([0] * run)
             else:
-                # Literal byte
-                result.append(byte)
+                result.append(b)
         
-        # Pad or truncate to expected size
-        if len(result) < expected_size:
-            result.extend([0] * (expected_size - len(result)))
-        elif len(result) > expected_size:
-            result = result[:expected_size]
-        
-        return bytes(result)
+        if len(result) < expected:
+            result.extend([0] * (expected - len(result)))
+        return bytes(result[:expected])
 
 
 # ==============================================================================
-# PALETTE UTILITIES
+# UTILITIES
 # ==============================================================================
 
 def load_palette(filepath: str) -> Optional[bytes]:
-    """
-    Load a palette file (.pal).
-    
-    RO palette files are simple 1024-byte files containing 256 RGBA colors.
-    These are used for recoloring sprites (hair dyes, class variations, etc.).
-    
-    Args:
-        filepath: Path to .pal file
-        
-    Returns:
-        Palette data (1024 bytes) or None on error
-    """
     try:
         with open(filepath, 'rb') as f:
             data = f.read()
-        
-        if len(data) >= 1024:
-            return data[:1024]
-        else:
-            print(f"[WARN] Palette file too small: {filepath}")
-            return data + b'\x00' * (1024 - len(data))
-            
-    except Exception as e:
-        print(f"[ERROR] Failed to load palette {filepath}: {e}")
+        return data[:1024] if len(data) >= 1024 else data + b'\x00' * (1024 - len(data))
+    except:
         return None
-
-
-def create_palette_from_colors(colors: List[Tuple[int, int, int, int]]) -> bytes:
-    """
-    Create a palette from a list of RGBA color tuples.
-    
-    Args:
-        colors: List of up to 256 (R, G, B, A) tuples
-        
-    Returns:
-        Palette data (1024 bytes)
-    """
-    palette = bytearray()
-    
-    for i in range(256):
-        if i < len(colors):
-            r, g, b, a = colors[i]
-            palette.extend([r, g, b, a])
-        else:
-            palette.extend([0, 0, 0, 0])
-    
-    return bytes(palette)
-
-
-# ==============================================================================
-# STANDALONE TEST
-# ==============================================================================
-
-if __name__ == "__main__":
-    # Quick test if run directly
-    import sys
-    
-    if len(sys.argv) > 1:
-        parser = SPRParser()
-        sprite = parser.load(sys.argv[1])
-        
-        if sprite:
-            print(f"SPR Version: {sprite.version}")
-            print(f"Indexed Frames: {sprite.get_indexed_count()}")
-            print(f"RGBA Frames: {sprite.get_rgba_count()}")
-            print(f"Total Frames: {sprite.get_total_frames()}")
-            
-            if PIL_AVAILABLE and sprite.get_total_frames() > 0:
-                img = sprite.get_frame_image(0)
-                if img:
-                    img.save("test_frame.png")
-                    print("Saved first frame to test_frame.png")
-    else:
-        print("Usage: python spr_parser.py <sprite.spr>")
