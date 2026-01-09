@@ -42,6 +42,15 @@ desktop.ini
 *.db
 data/harvester.db
 nul
+NUL
+
+# PyInstaller (auto-generated)
+*.spec
+
+# Test files and temporary outputs
+test_*.py
+test_*.png
+*.test
 
 # Reference code (not included in repo)
 GRFEditor-main/

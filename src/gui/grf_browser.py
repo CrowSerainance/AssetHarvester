@@ -27,9 +27,9 @@ try:
         QGroupBox, QLabel, QPushButton, QLineEdit, QFileDialog,
         QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem,
         QSplitter, QTextEdit, QMessageBox, QMenu, QProgressDialog,
-        QFrame, QScrollArea, QProgressBar, QApplication
+        QFrame, QScrollArea, QProgressBar, QApplication, QComboBox, QDoubleSpinBox, QCheckBox
     )
-    from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThread
+    from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThread, QTimer
     from PyQt6.QtGui import QImage, QPixmap, QPainter, QAction, QIcon
     PYQT_AVAILABLE = True
 except ImportError:
@@ -37,7 +37,7 @@ except ImportError:
 
 # Try to import PIL for image preview
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageOps
     from PIL.ImageQt import ImageQt
     PIL_AVAILABLE = True
 except ImportError:
@@ -115,6 +115,7 @@ class PreviewWorker(QThread):
 
     # Emit image as bytes + size tuple to avoid cross-thread PIL/Qt issues
     preview_ready = pyqtSignal(bytes, int, int, str, str)  # image_bytes, width, height, info_text, file_path
+    preview_act_ready = pyqtSignal(object, object, str, str)  # act_data, spr_data, info_text, file_path
     preview_text = pyqtSignal(str, str, str)  # text_content, info_text, file_path
     error = pyqtSignal(str, str)  # error_message, file_path
 
@@ -292,39 +293,11 @@ class PreviewWorker(QThread):
                         return
 
                     if sprite and sprite.get_total_frames() > 0:
-                        # Find first action with frames
-                        for i in range(act.get_action_count()):
-                            if self._cancelled:
-                                return
-
-                            action = act.get_action(i)
-                            if action and action.get_frame_count() > 0:
-                                frame = action.get_frame(0)
-                                if frame and len(frame.layers) > 0:
-                                    layer = frame.layers[0]
-                                    sprite_idx = layer.sprite_index
-
-                                    if sprite_idx >= 0:
-                                        if layer.sprite_type == 1:
-                                            sprite_idx += sprite.get_indexed_count()
-
-                                        if sprite_idx < sprite.get_total_frames():
-                                            if self._cancelled:
-                                                return
-
-                                            img = sprite.get_frame_image(sprite_idx)
-
-                                            if self._cancelled:
-                                                return
-
-                                            if img:
-                                                info_text += f"\n\nACT Details:\n"
-                                                info_text += f"Actions: {act.get_action_count()}\n"
-                                                info_text += f"Events: {len(act.events)}\n"
-                                                info_text += f"Action {i}: {action.get_frame_count()} frames, {len(frame.layers)} layers"
-                                                self._emit_image(img, info_text)
-                                                return
-                                break
+                        info_text += f"\n\nACT Details:\n"
+                        info_text += f"Actions: {act.get_action_count()}\n"
+                        info_text += f"Events: {len(act.events)}\n"
+                        self.preview_act_ready.emit(act, sprite, info_text, self.file_path)
+                        return
 
             # Fallback to text info
             info = f"ACT Version: {act.version}\n"
@@ -597,6 +570,31 @@ class GRFBrowserWidget(QWidget):
         self.preview_area.setWidget(self.preview_label)
         preview_layout.addWidget(self.preview_area)
         
+        # ACT preview controls (animation)
+        self.act_preview_controls = QHBoxLayout()
+        self.act_preview_controls.addWidget(QLabel("Action:"))
+        self.act_action_combo = QComboBox()
+        self.act_action_combo.currentIndexChanged.connect(self._on_act_action_changed)
+        self.act_preview_controls.addWidget(self.act_action_combo)
+        self.act_play_btn = QPushButton("▶ Play")
+        self.act_play_btn.clicked.connect(self._toggle_act_preview)
+        self.act_preview_controls.addWidget(self.act_play_btn)
+        
+        self.act_preview_controls.addWidget(QLabel("Delay x"))
+        self.act_delay_scale = QDoubleSpinBox()
+        self.act_delay_scale.setRange(0.1, 5.0)
+        self.act_delay_scale.setSingleStep(0.1)
+        self.act_delay_scale.setValue(1.0)
+        self.act_delay_scale.valueChanged.connect(self._on_act_delay_scale_changed)
+        self.act_preview_controls.addWidget(self.act_delay_scale)
+        
+        self.act_debug_overlay = QCheckBox("Debug overlay")
+        self.act_debug_overlay.toggled.connect(self._on_act_debug_toggled)
+        self.act_preview_controls.addWidget(self.act_debug_overlay)
+        
+        self.act_preview_controls.addStretch()
+        preview_layout.addLayout(self.act_preview_controls)
+        
         # File info
         self.file_info = QLabel("")
         self.file_info.setWordWrap(True)
@@ -626,6 +624,16 @@ class GRFBrowserWidget(QWidget):
         status_bar.addWidget(self.loading_progress)
         
         main_layout.addLayout(status_bar)
+        
+        # ACT preview state
+        self._act_preview_timer = QTimer(self)
+        self._act_preview_timer.timeout.connect(self._advance_act_preview_frame)
+        self._act_preview_act = None
+        self._act_preview_sprite = None
+        self._act_preview_action_idx = 0
+        self._act_preview_frame_idx = 0
+        self._act_preview_playing = False
+        self._act_preview_file_path = None
     
     def load_grf(self, grf_path: str, priority: int = 0) -> bool:
         """
@@ -964,6 +972,7 @@ class GRFBrowserWidget(QWidget):
         """Handle file list selection change."""
         # Cancel any running preview worker immediately
         self._cancel_preview_worker()
+        self._reset_act_preview()
 
         selected = self.file_list.selectedItems()
         if not selected:
@@ -1016,6 +1025,7 @@ class GRFBrowserWidget(QWidget):
         """Preview file using async worker thread (for heavy files like SPR/ACT)."""
         # Cancel any existing preview worker
         self._cancel_preview_worker()
+        self._reset_act_preview()
 
         # Show loading indicator
         self.preview_label.setText("Loading preview...")
@@ -1031,6 +1041,7 @@ class GRFBrowserWidget(QWidget):
             self._debug_mode
         )
         self._preview_worker.preview_ready.connect(self._on_preview_ready)
+        self._preview_worker.preview_act_ready.connect(self._on_act_preview_ready)
         self._preview_worker.preview_text.connect(self._on_preview_text)
         self._preview_worker.error.connect(self._on_preview_error)
         self._preview_worker.start()
@@ -1074,10 +1085,219 @@ class GRFBrowserWidget(QWidget):
         # Only update if this is still the current file
         if file_path != self._current_file_path:
             return
-
+        
         self.preview_label.setText(error_msg)
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.file_info.setText("Error - see preview for details")
+    
+    def _on_act_preview_ready(self, act_data, spr_data, info_text: str, file_path: str):
+        """Handle ACT preview ready from worker."""
+        if file_path != self._current_file_path:
+            return
+        
+        self._act_preview_act = act_data
+        self._act_preview_sprite = spr_data
+        self._act_preview_file_path = file_path
+        self.file_info.setText(info_text)
+        
+        # Populate action combo
+        self.act_action_combo.blockSignals(True)
+        self.act_action_combo.clear()
+        for idx in range(act_data.get_action_count()):
+            self.act_action_combo.addItem(f"Action {idx}", idx)
+        self.act_action_combo.setCurrentIndex(0)
+        self.act_action_combo.blockSignals(False)
+        
+        self._act_preview_action_idx = 0
+        self._act_preview_frame_idx = 0
+        self._render_act_preview_frame()
+    
+    def _reset_act_preview(self):
+        """Reset ACT preview state."""
+        self._act_preview_timer.stop()
+        self._act_preview_act = None
+        self._act_preview_sprite = None
+        self._act_preview_action_idx = 0
+        self._act_preview_frame_idx = 0
+        self._act_preview_playing = False
+        self._act_preview_file_path = None
+        self.act_action_combo.clear()
+        self.act_play_btn.setText("▶ Play")
+        self._act_delay_scale = 1.0
+        self.act_delay_scale.setValue(1.0)
+        self._act_debug_overlay_enabled = False
+        self.act_debug_overlay.setChecked(False)
+    
+    def _toggle_act_preview(self):
+        """Toggle ACT preview animation."""
+        if not self._act_preview_act or not self._act_preview_sprite:
+            return
+        
+        self._act_preview_playing = not self._act_preview_playing
+        if self._act_preview_playing:
+            self.act_play_btn.setText("⏸ Pause")
+            self._schedule_act_preview_frame()
+        else:
+            self.act_play_btn.setText("▶ Play")
+            self._act_preview_timer.stop()
+    
+    def _on_act_delay_scale_changed(self, value: float):
+        """Handle ACT delay scale change."""
+        self._act_delay_scale = float(value)
+        if self._act_preview_playing:
+            self._schedule_act_preview_frame()
+    
+    def _on_act_debug_toggled(self, checked: bool):
+        """Handle ACT debug overlay toggle."""
+        self._act_debug_overlay_enabled = checked
+        self._render_act_preview_frame()
+    
+    def _on_act_action_changed(self, index: int):
+        """Handle ACT action dropdown change."""
+        if index < 0 or not self._act_preview_act:
+            return
+        
+        self._act_preview_action_idx = self.act_action_combo.currentData() or 0
+        self._act_preview_frame_idx = 0
+        self._render_act_preview_frame()
+    
+    def _advance_act_preview_frame(self):
+        """Advance ACT preview to next frame."""
+        if not self._act_preview_act:
+            return
+        
+        action = self._act_preview_act.get_action(self._act_preview_action_idx)
+        if not action or action.get_frame_count() == 0:
+            return
+        
+        self._act_preview_frame_idx = (self._act_preview_frame_idx + 1) % action.get_frame_count()
+        self._render_act_preview_frame()
+        if self._act_preview_playing:
+            self._schedule_act_preview_frame()
+    
+    def _schedule_act_preview_frame(self):
+        """Schedule next ACT preview frame based on delay."""
+        action = self._act_preview_act.get_action(self._act_preview_action_idx)
+        if not action or action.get_frame_count() == 0:
+            return
+        
+        frame = action.get_frame(self._act_preview_frame_idx)
+        delay = int(getattr(frame, "delay", 0)) if frame else 0
+        if delay <= 0:
+            delay = 100  # Default 100ms if no delay specified
+        delay = int(delay * self._act_delay_scale)
+        if delay <= 0:
+            delay = 1
+        self._act_preview_timer.start(delay)
+    
+    def _render_act_preview_frame(self):
+        """Render current ACT preview frame."""
+        if not (self._act_preview_act and self._act_preview_sprite):
+            return
+        
+        if not PIL_AVAILABLE:
+            self.preview_label.setText("PIL not available — preview disabled")
+            return
+        
+        action = self._act_preview_act.get_action(self._act_preview_action_idx)
+        if not action or action.get_frame_count() == 0:
+            self.preview_label.setText("No frames to render")
+            return
+        
+        frame = action.get_frame(self._act_preview_frame_idx)
+        if not frame:
+            self.preview_label.setText("Invalid frame")
+            return
+        
+        # Composite layers onto a canvas
+        canvas_size = 512
+        canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+        center = canvas_size // 2
+        
+        for layer in frame.layers:
+            sprite_idx = layer.sprite_index
+            if sprite_idx < 0:
+                continue
+            
+            if layer.sprite_type == 1:
+                sprite_idx += self._act_preview_sprite.get_indexed_count()
+            
+            if sprite_idx >= self._act_preview_sprite.get_total_frames():
+                continue
+            
+            img = self._act_preview_sprite.get_frame_image(sprite_idx)
+            if img is None:
+                continue
+            
+            img = self._apply_layer_transforms(img, layer)
+            
+            x = center + layer.x - (img.width // 2)
+            y = center + layer.y - (img.height // 2)
+            canvas.alpha_composite(img, (x, y))
+            
+            if self._act_debug_overlay_enabled:
+                draw = ImageDraw.Draw(canvas)
+                label = f"{sprite_idx} ({'RGBA' if layer.sprite_type == 1 else 'IDX'})"
+                draw.rectangle([x, y, x + img.width, y + img.height], outline=(255, 255, 0, 200))
+                draw.text((x + 2, y + 2), label, fill=(255, 255, 0, 220))
+        
+        # Convert to QPixmap and display
+        try:
+            qimage = ImageQt.ImageQt(canvas)
+            pixmap = QPixmap.fromImage(qimage)
+            
+            # Scale if too large
+            max_size = 512
+            if pixmap.width() > max_size or pixmap.height() > max_size:
+                pixmap = pixmap.scaled(max_size, max_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            
+            self.preview_label.setPixmap(pixmap)
+            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        except Exception as e:
+            self.preview_label.setText(f"Render error: {e}")
+    
+    def _apply_layer_transforms(self, img: Image.Image, layer) -> Image.Image:
+        """Apply layer transforms (width/height override, mirror, scale, rotation, color tint) to image."""
+        # Width/height override (if provided in ACT)
+        if getattr(layer, "width", 0) > 0 and getattr(layer, "height", 0) > 0:
+            img = img.resize((layer.width, layer.height), resample=Image.Resampling.BICUBIC)
+        
+        # Mirror
+        if getattr(layer, "mirror", False):
+            img = ImageOps.mirror(img)
+        
+        # Scale
+        scale_x = getattr(layer, "scale_x", 1.0)
+        scale_y = getattr(layer, "scale_y", 1.0)
+        if scale_x != 1.0 or scale_y != 1.0:
+            new_w = max(1, int(img.width * scale_x))
+            new_h = max(1, int(img.height * scale_y))
+            img = img.resize((new_w, new_h), resample=Image.Resampling.BICUBIC)
+        
+        # Rotation (degrees)
+        rotation = getattr(layer, "rotation", 0)
+        if rotation:
+            img = img.rotate(-rotation, expand=True, resample=Image.Resampling.BICUBIC)
+        
+        # Color tint (RGBA)
+        color = getattr(layer, "color", (255, 255, 255, 255))
+        if color and color != (255, 255, 255, 255):
+            img = self._apply_color_tint(img, color)
+        
+        return img
+    
+    def _apply_color_tint(self, img: Image.Image, color: tuple) -> Image.Image:
+        """Apply color tint to image."""
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
+        r_t, g_t, b_t, a_t = color
+        r, g, b, a = img.split()
+        r = r.point(lambda p: (p * r_t) // 255)
+        g = g.point(lambda p: (p * g_t) // 255)
+        b = b.point(lambda p: (p * b_t) // 255)
+        if a_t < 255:
+            a = a.point(lambda p: (p * a_t) // 255)
+        return Image.merge("RGBA", (r, g, b, a))
 
     def _preview_file_sync(self, file_path: str):
         """Preview a file synchronously (for fast file types)."""
