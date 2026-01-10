@@ -634,6 +634,9 @@ class GRFBrowserWidget(QWidget):
         self._act_preview_frame_idx = 0
         self._act_preview_playing = False
         self._act_preview_file_path = None
+        self._act_delay_scale = 1.0
+        self._act_debug_overlay_enabled = False
+        self._act_frame_cache = {}  # Cache rendered SPR frames: {sprite_idx: Image}
     
     def load_grf(self, grf_path: str, priority: int = 0) -> bool:
         """
@@ -1127,6 +1130,7 @@ class GRFBrowserWidget(QWidget):
         self.act_delay_scale.setValue(1.0)
         self._act_debug_overlay_enabled = False
         self.act_debug_overlay.setChecked(False)
+        self._act_frame_cache.clear()  # Clear cache when resetting
     
     def _toggle_act_preview(self):
         """Toggle ACT preview animation."""
@@ -1225,7 +1229,15 @@ class GRFBrowserWidget(QWidget):
             if sprite_idx >= self._act_preview_sprite.get_total_frames():
                 continue
             
-            img = self._act_preview_sprite.get_frame_image(sprite_idx)
+            # Use cached frame if available (performance optimization)
+            if sprite_idx in self._act_frame_cache:
+                img = self._act_frame_cache[sprite_idx]
+            else:
+                img = self._act_preview_sprite.get_frame_image(sprite_idx)
+                if img is not None:
+                    # Cache the rendered frame for future use
+                    self._act_frame_cache[sprite_idx] = img
+            
             if img is None:
                 continue
             

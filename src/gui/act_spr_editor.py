@@ -91,6 +91,7 @@ class ACTSPREditorWidget(QWidget):
         self._anim_frame_idx = 0
         self._anim_delay_scale = 1.0
         self._debug_overlay = False
+        self._frame_cache = {}  # Cache rendered SPR frames: {sprite_idx: Image}
         
         # Build UI
         self._setup_ui()
@@ -570,7 +571,15 @@ class ACTSPREditorWidget(QWidget):
             if sprite_idx >= self.loaded_spr_data.get_total_frames():
                 continue
             
-            img = self.loaded_spr_data.get_frame_image(sprite_idx)
+            # Use cached frame if available (performance optimization)
+            if sprite_idx in self._frame_cache:
+                img = self._frame_cache[sprite_idx]
+            else:
+                img = self.loaded_spr_data.get_frame_image(sprite_idx)
+                if img is not None:
+                    # Cache the rendered frame for future use
+                    self._frame_cache[sprite_idx] = img
+            
             if img is None:
                 continue
             

@@ -116,31 +116,47 @@ def convert_bgra32_to_rgba(data: bytes, width: int, height: int) -> Optional[byt
         data = data + b'\x00' * (expected_size - len(data))
 
     try:
-        # Optimized: Process row by row instead of pixel by pixel
-        # This is ~5x faster than per-pixel loop
+        # Try NumPy first (much faster for large images)
+        try:
+            import numpy as np
+            # Reshape to (height, width, 4) - note: data is already in correct order
+            arr = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 4))
+            # Reorder channels: ARGB -> RGBA using advanced indexing
+            # Original: [A, R, G, B] -> Target: [R, G, B, A]
+            arr = arr[:, :, [1, 2, 3, 0]]  # Reorder channels
+            # Flip Y-axis (bottom-to-top -> top-to-bottom)
+            arr = np.flipud(arr)
+            return arr.tobytes()
+        except ImportError:
+            # NumPy not available, use optimized Python
+            pass
+        except Exception as e:
+            print(f"[WARN] NumPy BGRA32 conversion failed: {e}, using Python fallback")
+        
+        # Optimized Python fallback: Process row by row with pre-allocated bytearray
         rgba_rows = []
         row_size = width * 4
+        output = bytearray(height * row_size)
 
         # Process rows in reverse order (Y-flip)
         for y in range(height - 1, -1, -1):
             row_start = y * row_size
             row_data = data[row_start:row_start + row_size]
+            
+            # Calculate output row position (flipped)
+            output_row = (height - 1 - y) * row_size
 
-            # Convert ARGB to RGBA for this row
-            # GRF format: [A, R, G, B] -> need [R, G, B, A]
-            row_rgba = bytearray(row_size)
+            # Convert ARGB to RGBA for this row using slice assignment (faster than loop)
+            # ARGB: [A,R,G,B] -> RGBA: [R,G,B,A]
             for x in range(width):
                 src_idx = x * 4
-                dst_idx = x * 4
-                # ARGB to RGBA: [A,R,G,B] -> [R,G,B,A]
-                row_rgba[dst_idx + 0] = row_data[src_idx + 1]  # R
-                row_rgba[dst_idx + 1] = row_data[src_idx + 2]  # G
-                row_rgba[dst_idx + 2] = row_data[src_idx + 3]  # B
-                row_rgba[dst_idx + 3] = row_data[src_idx + 0]  # A
+                dst_idx = output_row + x * 4
+                output[dst_idx + 0] = row_data[src_idx + 1]  # R
+                output[dst_idx + 1] = row_data[src_idx + 2]  # G
+                output[dst_idx + 2] = row_data[src_idx + 3]  # B
+                output[dst_idx + 3] = row_data[src_idx + 0]  # A
 
-            rgba_rows.append(bytes(row_rgba))
-
-        return b''.join(rgba_rows)
+        return bytes(output)
 
     except (IndexError, ValueError) as e:
         return None
