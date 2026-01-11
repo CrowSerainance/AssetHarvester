@@ -25,7 +25,7 @@ Asset Harvester is a desktop application designed to extract, compare, and catal
 | Silkroad Online | .pk2 | 🔄 Planned |
 | Any Other | Various | Via QuickBMS |
 
-## Installation
+## Installation!
 
 ### Prerequisites
 
