@@ -136,16 +136,49 @@ class PreviewWorker(QThread):
         """Convert PIL image to bytes and emit signal (thread-safe)."""
         if self._cancelled:
             return
+        
+        if img is None:
+            self.error.emit("Image is None - rendering failed", self.file_path)
+            return
+        
         try:
+            # Validate image dimensions
+            width, height = img.size
+            if width <= 0 or height <= 0:
+                self.error.emit(f"Invalid image dimensions: {width}x{height}", self.file_path)
+                return
+            
+            if width > 4096 or height > 4096:
+                # Scale down oversized images
+                scale = min(4096 / width, 4096 / height)
+                new_size = (int(width * scale), int(height * scale))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                width, height = img.size
+                if self.debug_mode:
+                    print(f"[DEBUG] Scaled image from {width}x{height} to {new_size}")
+            
             # Convert to RGBA if needed
             if img.mode != 'RGBA':
                 img = img.convert('RGBA')
-            # Get raw bytes - this is thread-safe
+            
+            # Validate byte count
             img_bytes = img.tobytes()
-            width, height = img.size
+            expected_bytes = width * height * 4
+            if len(img_bytes) != expected_bytes:
+                self.error.emit(f"Image byte mismatch: got {len(img_bytes)}, expected {expected_bytes}", self.file_path)
+                return
+            
+            if self.debug_mode:
+                print(f"[DEBUG] Emitting image: {width}x{height}, {len(img_bytes)} bytes")
+            
             self.preview_ready.emit(img_bytes, width, height, info_text, self.file_path)
+            
         except Exception as e:
-            self.error.emit(f"Failed to convert image: {e}", self.file_path)
+            import traceback
+            error_msg = f"Failed to convert image: {e}"
+            if self.debug_mode:
+                error_msg += f"\n{traceback.format_exc()}"
+            self.error.emit(error_msg, self.file_path)
 
     def run(self):
         """Load and render preview in background thread."""
@@ -637,6 +670,7 @@ class GRFBrowserWidget(QWidget):
         self._act_delay_scale = 1.0
         self._act_debug_overlay_enabled = False
         self._act_frame_cache = {}  # Cache rendered SPR frames: {sprite_idx: Image}
+        self._preview_img_bytes = None  # Keep reference for QImage byte lifetime
     
     def load_grf(self, grf_path: str, priority: int = 0) -> bool:
         """
@@ -1030,6 +1064,14 @@ class GRFBrowserWidget(QWidget):
         self._cancel_preview_worker()
         self._reset_act_preview()
 
+        # Debug output
+        if self._debug_mode:
+            print(f"[DEBUG] Starting async preview for: {file_path}")
+            print(f"[DEBUG] VFS loaded: {self.vfs is not None}")
+            print(f"[DEBUG] SPR parser: {self.spr_parser is not None}")
+            print(f"[DEBUG] ACT parser: {self.act_parser is not None}")
+            print(f"[DEBUG] PIL available: {PIL_AVAILABLE}")
+
         # Show loading indicator
         self.preview_label.setText("Loading preview...")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1043,11 +1085,28 @@ class GRFBrowserWidget(QWidget):
             self.act_parser,
             self._debug_mode
         )
-        self._preview_worker.preview_ready.connect(self._on_preview_ready)
+        
+        # Connect signals with debug wrappers if in debug mode
+        if self._debug_mode:
+            self._preview_worker.preview_ready.connect(
+                lambda *args: self._debug_log_preview_ready(*args) or self._on_preview_ready(*args)
+            )
+        else:
+            self._preview_worker.preview_ready.connect(self._on_preview_ready)
+        
         self._preview_worker.preview_act_ready.connect(self._on_act_preview_ready)
         self._preview_worker.preview_text.connect(self._on_preview_text)
         self._preview_worker.error.connect(self._on_preview_error)
         self._preview_worker.start()
+    
+    def _debug_log_preview_ready(self, img_bytes: bytes, width: int, height: int, info_text: str, file_path: str):
+        """Debug logging for preview ready signal."""
+        print(f"[DEBUG] Preview ready signal received:")
+        print(f"[DEBUG]   File: {file_path}")
+        print(f"[DEBUG]   Dimensions: {width}x{height}")
+        print(f"[DEBUG]   Bytes: {len(img_bytes)}")
+        print(f"[DEBUG]   Expected: {width * height * 4}")
+        return False  # Return False so lambda continues to _on_preview_ready
 
     def _on_preview_ready(self, img_bytes: bytes, width: int, height: int, info_text: str, file_path: str):
         """Handle preview image ready from worker."""
@@ -1056,22 +1115,73 @@ class GRFBrowserWidget(QWidget):
             return
 
         try:
-            # Reconstruct QImage from raw bytes (thread-safe)
-            qimg = QImage(img_bytes, width, height, width * 4, QImage.Format.Format_RGBA8888)
-            # Make a copy since the original bytes might go out of scope
+            # Validate input
+            expected_size = width * height * 4
+            if len(img_bytes) != expected_size:
+                error_msg = f"Image size mismatch: got {len(img_bytes)} bytes, expected {expected_size}"
+                if self._debug_mode:
+                    print(f"[DEBUG] {error_msg}")
+                self.preview_label.setText(error_msg)
+                return
+            
+            if width <= 0 or height <= 0:
+                error_msg = f"Invalid dimensions: {width}x{height}"
+                if self._debug_mode:
+                    print(f"[DEBUG] {error_msg}")
+                self.preview_label.setText(error_msg)
+                return
+            
+            # Create QImage with explicit stride (bytes per line)
+            stride = width * 4  # 4 bytes per pixel for RGBA
+            
+            # IMPORTANT: QImage doesn't copy the data, so we need to keep img_bytes alive
+            # Store reference to prevent garbage collection
+            self._preview_img_bytes = img_bytes
+            
+            qimg = QImage(self._preview_img_bytes, width, height, stride, QImage.Format.Format_RGBA8888)
+            
+            # Verify QImage was created successfully
+            if qimg.isNull():
+                error_msg = "Failed to create QImage from bytes"
+                if self._debug_mode:
+                    print(f"[DEBUG] {error_msg} - width={width}, height={height}, stride={stride}, bytes_len={len(img_bytes)}")
+                self.preview_label.setText(error_msg)
+                self._preview_img_bytes = None
+                return
+            
+            # Now make a deep copy (this copies the pixel data)
             qimg = qimg.copy()
+            
+            # Clear the reference since we have a copy now
+            self._preview_img_bytes = None
+            
             pixmap = QPixmap.fromImage(qimg)
+            
+            if pixmap.isNull():
+                error_msg = "Failed to create pixmap from QImage"
+                if self._debug_mode:
+                    print(f"[DEBUG] {error_msg}")
+                self.preview_label.setText(error_msg)
+                return
 
             # Scale if too large
             max_size = 800
             if pixmap.width() > max_size or pixmap.height() > max_size:
-                pixmap = pixmap.scaled(max_size, max_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                pixmap = pixmap.scaled(max_size, max_size, 
+                                       Qt.AspectRatioMode.KeepAspectRatio, 
+                                       Qt.TransformationMode.SmoothTransformation)
 
             self.preview_label.setPixmap(pixmap)
             self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.file_info.setText(info_text)
+            
         except Exception as e:
-            self.preview_label.setText(f"Failed to display image: {e}")
+            import traceback
+            error_msg = f"Failed to display image:\n{e}"
+            if self._debug_mode:
+                error_msg += f"\n\n{traceback.format_exc()}"
+            self.preview_label.setText(error_msg)
+            self._preview_img_bytes = None
 
     def _on_preview_text(self, text: str, info_text: str, file_path: str):
         """Handle preview text ready from worker."""
@@ -1098,22 +1208,63 @@ class GRFBrowserWidget(QWidget):
         if file_path != self._current_file_path:
             return
         
+        # Clear any existing cache first
+        self._act_frame_cache.clear()
+        
         self._act_preview_act = act_data
         self._act_preview_sprite = spr_data
         self._act_preview_file_path = file_path
         self.file_info.setText(info_text)
         
-        # Populate action combo
+        # Validate sprite data is usable
+        if not spr_data or spr_data.get_total_frames() == 0:
+            error_msg = "❌ SPR has no frames - cannot preview ACT"
+            if self._debug_mode:
+                print(f"[DEBUG] ACT preview failed: {error_msg}")
+            self.preview_label.setText(error_msg)
+            return
+        
+        # Populate action combo with frame counts
         self.act_action_combo.blockSignals(True)
         self.act_action_combo.clear()
         for idx in range(act_data.get_action_count()):
-            self.act_action_combo.addItem(f"Action {idx}", idx)
+            action = act_data.get_action(idx)
+            frame_count = action.get_frame_count() if action else 0
+            self.act_action_combo.addItem(f"Action {idx} ({frame_count} frames)", idx)
         self.act_action_combo.setCurrentIndex(0)
         self.act_action_combo.blockSignals(False)
         
         self._act_preview_action_idx = 0
         self._act_preview_frame_idx = 0
+        
+        # Pre-cache first few sprite frames to ensure render works
+        self._precache_sprite_frames(5)
+        
+        # Now render
         self._render_act_preview_frame()
+    
+    def _precache_sprite_frames(self, count: int):
+        """Pre-cache sprite frames for smoother preview."""
+        if not self._act_preview_sprite:
+            return
+        
+        if self._debug_mode:
+            print(f"[DEBUG] Pre-caching {count} sprite frames...")
+        
+        cached = 0
+        for i in range(min(count, self._act_preview_sprite.get_total_frames())):
+            if i not in self._act_frame_cache:
+                try:
+                    img = self._act_preview_sprite.get_frame_image(i)
+                    if img:
+                        self._act_frame_cache[i] = img
+                        cached += 1
+                except Exception as e:
+                    if self._debug_mode:
+                        print(f"[DEBUG] Failed to cache frame {i}: {e}")
+        
+        if self._debug_mode:
+            print(f"[DEBUG] Cached {cached} frames")
     
     def _reset_act_preview(self):
         """Reset ACT preview state."""

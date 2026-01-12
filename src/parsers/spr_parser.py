@@ -175,21 +175,22 @@ class SPRSprite:
         
         try:
             if frame.is_rgba():
-                return self._render_rgba(frame)
+                return self._render_rgba(frame, self.version)
             else:
                 return self._render_indexed(frame)
         except Exception as e:
             print(f"[ERROR] Frame render failed: {e}")
             return None
 
-    def _render_rgba(self, frame: SPRFrame) -> Optional['Image.Image']:
+    def _render_rgba(self, frame: SPRFrame, version: Optional[Tuple[int, int]] = None) -> Optional['Image.Image']:
         """
         Render RGBA frame to PIL Image.
         
-        CRITICAL: GRFEditor reference shows:
-          - Data stored BOTTOM-TO-TOP (vertical flip needed)
-          - Channel order in file: A, R, G, B (ARGB)
-          - Need to convert to: R, G, B, A (RGBA)
+        SPR versions and channel orders:
+        - Version 1.x: ABGR format (rare, very old files)
+        - Version 2.x: ARGB format (standard)
+        
+        Both are stored bottom-to-top (vertical flip needed).
         
         GRFEditor code (SprLoader.cs _loadBgra32Image):
             for (int y = 0; y < height; y++) {
@@ -202,8 +203,6 @@ class SPRSprite:
                     realData[index2 + 3] = data[index + 0];  // A from position 0
                 }
             }
-        
-        So file format is: [A][R][G][B] per pixel, stored bottom-to-top.
         """
         width = frame.width
         height = frame.height
@@ -216,6 +215,11 @@ class SPRSprite:
         else:
             data = data[:size]
         
+        # Detect channel order by version (legacy 1.x uses ABGR)
+        use_abgr = False
+        if version and version < (2, 0):
+            use_abgr = True  # Legacy format
+        
         if NUMPY_AVAILABLE:
             try:
                 # Create array from raw data
@@ -225,10 +229,12 @@ class SPRSprite:
                 # Vertical flip (image stored bottom-to-top)
                 arr = np.flipud(arr)
                 
-                # Channel reorder: ARGB (file) -> RGBA (output)
-                # File: [0]=A, [1]=R, [2]=G, [3]=B
-                # Output: [0]=R, [1]=G, [2]=B, [3]=A
-                rgba = arr[:, :, [1, 2, 3, 0]]
+                if use_abgr:
+                    # ABGR → RGBA: [A][B][G][R] → [R][G][B][A]
+                    rgba = arr[:, :, [3, 2, 1, 0]]
+                else:
+                    # ARGB → RGBA: [A][R][G][B] → [R][G][B][A]
+                    rgba = arr[:, :, [1, 2, 3, 0]]
                 
                 return Image.fromarray(rgba, 'RGBA')
             except Exception as e:
@@ -243,11 +249,18 @@ class SPRSprite:
                 src_idx = (src_y * width + x) * 4
                 dst_idx = (y * width + x) * 4
                 
-                # ARGB -> RGBA
-                pixels[dst_idx + 0] = data[src_idx + 1]  # R
-                pixels[dst_idx + 1] = data[src_idx + 2]  # G
-                pixels[dst_idx + 2] = data[src_idx + 3]  # B
-                pixels[dst_idx + 3] = data[src_idx + 0]  # A
+                if use_abgr:
+                    # ABGR → RGBA
+                    pixels[dst_idx + 0] = data[src_idx + 3]  # R
+                    pixels[dst_idx + 1] = data[src_idx + 2]  # G
+                    pixels[dst_idx + 2] = data[src_idx + 1]  # B
+                    pixels[dst_idx + 3] = data[src_idx + 0]  # A
+                else:
+                    # ARGB -> RGBA
+                    pixels[dst_idx + 0] = data[src_idx + 1]  # R
+                    pixels[dst_idx + 1] = data[src_idx + 2]  # G
+                    pixels[dst_idx + 2] = data[src_idx + 3]  # B
+                    pixels[dst_idx + 3] = data[src_idx + 0]  # A
         
         return Image.frombytes("RGBA", (width, height), bytes(pixels))
 
@@ -290,8 +303,13 @@ class SPRSprite:
                 # Build RGBA palette array (256 colors × 4 channels)
                 pal_arr = np.frombuffer(pal[:1024], dtype=np.uint8).copy().reshape(256, 4)
                 
-                # Fix palette alpha: all = 255, index 0 = 0
-                pal_arr[:, 3] = 255
+                # Only force index 0 to be transparent, preserve other alpha values
+                # BUT if all alpha values are 0 (buggy palette), set them to 255
+                if np.all(pal_arr[:, 3] == 0):
+                    # Buggy palette - all alpha is 0, fix it
+                    pal_arr[:, 3] = 255
+                
+                # Always ensure index 0 is transparent
                 pal_arr[0, 3] = 0
                 
                 # Create pixel index array
@@ -415,6 +433,8 @@ class SPRParser:
         
         Based on GRFEditor's SprLoader.cs implementation.
         """
+        # Store version for use in rendering
+        sprite_version = None
         try:
             # ===============================================================
             # HEADER PARSING
@@ -429,6 +449,7 @@ class SPRParser:
             minor = data[2]
             major = data[3]
             version = (major, minor)
+            sprite_version = version  # Store for rendering
             
             # Validate version (support 1.x, 2.x)
             if major < 1 or major > 3:
