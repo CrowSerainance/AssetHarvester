@@ -327,14 +327,33 @@ class SPRSprite:
         
         # Pure Python fallback
         # Build lookup table: 256 entries of (R, G, B, A)
+        # First, check if palette has buggy alpha (all zeros)
+        all_alpha_zero = True
+        for i in range(256):
+            o = i * 4 + 3  # Alpha channel offset
+            if o < len(pal) and pal[o] != 0:
+                all_alpha_zero = False
+                break
+        
         lut = []
         for i in range(256):
             o = i * 4
             r = pal[o] if o < len(pal) else 0
             g = pal[o + 1] if o + 1 < len(pal) else 0
             b = pal[o + 2] if o + 2 < len(pal) else 0
-            # Alpha: 0 for index 0 (transparent), 255 for all others
-            a = 0 if i == 0 else 255
+            # Alpha: preserve from palette, but fix buggy palettes and ensure index 0 is transparent
+            if o + 3 < len(pal):
+                a = pal[o + 3]
+                # If all alpha values are 0 (buggy palette), set to 255
+                if all_alpha_zero:
+                    a = 255
+            else:
+                a = 255 if i > 0 else 0
+            
+            # Always ensure index 0 is transparent
+            if i == 0:
+                a = 0
+            
             lut.append((r, g, b, a))
         
         # Convert pixels using lookup table
