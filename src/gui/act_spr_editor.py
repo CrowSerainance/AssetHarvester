@@ -26,9 +26,9 @@ try:
         QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
         QGroupBox, QLabel, QPushButton, QLineEdit, QFileDialog,
         QMessageBox, QTreeWidget, QTreeWidgetItem, QScrollArea,
-        QCheckBox, QSpinBox, QComboBox, QDoubleSpinBox
+        QCheckBox, QSpinBox, QComboBox, QDoubleSpinBox, QListWidget, QListWidgetItem
     )
-    from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal, QTimer
+    from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal, QTimer, QSize
     PYQT_AVAILABLE = True
 except ImportError:
     PYQT_AVAILABLE = False
@@ -224,7 +224,17 @@ class ACTSPREditorWidget(QWidget):
         
         anim_controls.addStretch()
         preview_layout.addLayout(anim_controls)
-        
+
+        # Sprite strip (like ActEditor)
+        self.sprite_strip = QListWidget()
+        self.sprite_strip.setViewMode(QListWidget.ViewMode.IconMode)
+        self.sprite_strip.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.sprite_strip.setIconSize(QSize(48, 48))
+        self.sprite_strip.setMovement(QListWidget.Movement.Static)
+        self.sprite_strip.setMinimumHeight(120)
+        self.sprite_strip.itemClicked.connect(self._on_sprite_strip_clicked)
+        preview_layout.addWidget(self.sprite_strip)
+
         layout.addWidget(preview_group)
         
         # Action buttons
@@ -336,6 +346,7 @@ class ACTSPREditorWidget(QWidget):
         self._anim_action_idx = 0
         self._anim_frame_idx = 0
         self._render_current_frame()
+        self._populate_sprite_strip()
     
     def _on_tree_item_clicked(self, item, column):
         """Handle click on tree item - show properties."""
@@ -653,6 +664,34 @@ class ACTSPREditorWidget(QWidget):
         if a_t < 255:
             a = a.point(lambda p: (p * a_t) // 255)
         return Image.merge("RGBA", (r, g, b, a))
+
+    def _populate_sprite_strip(self):
+        """Populate the sprite strip with all sprite frames."""
+        self.sprite_strip.clear()
+        if not self.loaded_spr_data or not PIL_AVAILABLE:
+            return
+        total = self.loaded_spr_data.get_total_frames()
+        for idx in range(total):
+            img = self.loaded_spr_data.get_frame_image(idx)
+            if img is None:
+                continue
+            from PyQt6.QtGui import QPixmap, QIcon
+            qimage = ImageQt.ImageQt(img)
+            pixmap = QPixmap.fromImage(qimage)
+            item = QListWidgetItem()
+            item.setIcon(QIcon(pixmap))
+            item.setText(str(idx))
+            item.setData(Qt.ItemDataRole.UserRole, idx)
+            self.sprite_strip.addItem(item)
+
+    def _on_sprite_strip_clicked(self, item: QListWidgetItem):
+        """Handle click on sprite strip item."""
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        if idx is None:
+            return
+        # Jump to frame by sprite index (best-effort)
+        self._anim_frame_idx = 0
+        self._render_current_frame()
     
     def _show_layer_properties(self, action_idx: int, frame_idx: int, layer_idx: int):
         """Show editable properties for a layer."""
