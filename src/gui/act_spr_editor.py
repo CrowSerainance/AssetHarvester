@@ -48,7 +48,6 @@ except ImportError:
 # Pillow for rendering
 try:
     from PIL import Image, ImageOps, ImageDraw
-    from PIL.ImageQt import ImageQt
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -566,68 +565,89 @@ class ACTSPREditorWidget(QWidget):
             self.preview_label.setText("Invalid frame")
             return
         
-        # Composite layers onto a canvas
-        canvas_size = 512
-        canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-        center = canvas_size // 2
-        
+        render_items = []
+        min_x = 10**9
+        min_y = 10**9
+        max_x = -10**9
+        max_y = -10**9
+
         for layer in frame.layers:
             sprite_idx = layer.sprite_index
             if sprite_idx < 0:
                 continue
-            
-            if layer.sprite_type == 1:
+
+            if getattr(layer, "sprite_type", 0) == 1:
                 sprite_idx += self.loaded_spr_data.get_indexed_count()
-            
+
             if sprite_idx >= self.loaded_spr_data.get_total_frames():
                 continue
-            
-            # Use cached frame if available (performance optimization)
+
             if sprite_idx in self._frame_cache:
                 img = self._frame_cache[sprite_idx]
             else:
                 img = self.loaded_spr_data.get_frame_image(sprite_idx)
                 if img is not None:
-                    # Cache the rendered frame for future use
                     self._frame_cache[sprite_idx] = img
-            
+
             if img is None:
                 continue
-            
+
             img = self._apply_layer_transforms(img, layer)
-            
-            # Apply transform basics (position only)
-            x = center + layer.x - (img.width // 2)
-            y = center + layer.y - (img.height // 2)
+
+            lx = int(getattr(layer, "x", 0) - (img.width // 2))
+            ly = int(getattr(layer, "y", 0) - (img.height // 2))
+
+            min_x = min(min_x, lx)
+            min_y = min(min_y, ly)
+            max_x = max(max_x, lx + img.width)
+            max_y = max(max_y, ly + img.height)
+
+            render_items.append((img, lx, ly, sprite_idx, layer))
+
+        if not render_items:
+            self.preview_label.setText("No drawable layers")
+            return
+
+        padding = 24
+        width = int(max(64, min(1024, (max_x - min_x) + padding * 2)))
+        height = int(max(64, min(1024, (max_y - min_y) + padding * 2)))
+
+        canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+
+        for img, lx, ly, sprite_idx, layer in render_items:
+            x = int(lx - min_x + padding)
+            y = int(ly - min_y + padding)
             canvas.alpha_composite(img, (x, y))
-            
-            if self._debug_overlay:
-                draw = ImageDraw.Draw(canvas)
-                label = f"{sprite_idx} ({'RGBA' if layer.sprite_type == 1 else 'IDX'})"
-                draw.rectangle([x, y, x + img.width, y + img.height], outline=(255, 255, 0, 200))
-                draw.text((x + 2, y + 2), label, fill=(255, 255, 0, 220))
-        
-        # Convert to QPixmap and display
+
         try:
-            from PyQt6.QtGui import QPixmap
-            qimage = ImageQt.ImageQt(canvas)
-            pixmap = QPixmap.fromImage(qimage)
-            
-            # Scale if too large
+            from PyQt6.QtGui import QPixmap, QImage
+
+            if canvas.mode != "RGBA":
+                canvas = canvas.convert("RGBA")
+            w, h = canvas.size
+            buf = canvas.tobytes()
+            qimg = QImage(buf, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+            pixmap = QPixmap.fromImage(qimg)
+
             max_size = 512
             if pixmap.width() > max_size or pixmap.height() > max_size:
-                pixmap = pixmap.scaled(max_size, max_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            
+                pixmap = pixmap.scaled(
+                    max_size,
+                    max_size,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+
             self.preview_label.setPixmap(pixmap)
+
         except Exception as e:
             self.preview_label.setText(f"Render error: {e}")
     
     def _apply_layer_transforms(self, img: Image.Image, layer) -> Image.Image:
         """Apply layer transforms (width/height override, mirror, scale, rotation, color tint) to image."""
-        # Width/height override (if provided in ACT)
-        if getattr(layer, "width", 0) > 0 and getattr(layer, "height", 0) > 0:
-            img = img.resize((layer.width, layer.height), resample=Image.Resampling.BICUBIC)
-        
+        # NOTE: ACT v2.5 stores width/height fields, but GRFEditor/ActEditor override
+        # them with the real sprite dimensions for rendering. Resizing here causes distortion.
+
         # Mirror
         if getattr(layer, "mirror", False):
             img = ImageOps.mirror(img)
@@ -638,12 +658,12 @@ class ACTSPREditorWidget(QWidget):
         if scale_x != 1.0 or scale_y != 1.0:
             new_w = max(1, int(img.width * scale_x))
             new_h = max(1, int(img.height * scale_y))
-            img = img.resize((new_w, new_h), resample=Image.Resampling.BICUBIC)
+            img = img.resize((new_w, new_h), resample=Image.Resampling.NEAREST)
         
         # Rotation (degrees)
         rotation = getattr(layer, "rotation", 0)
         if rotation:
-            img = img.rotate(-rotation, expand=True, resample=Image.Resampling.BICUBIC)
+            img = img.rotate(-rotation, expand=True, resample=Image.Resampling.NEAREST)
         
         # Color tint (RGBA)
         color = getattr(layer, "color", (255, 255, 255, 255))
@@ -675,8 +695,12 @@ class ACTSPREditorWidget(QWidget):
             img = self.loaded_spr_data.get_frame_image(idx)
             if img is None:
                 continue
-            from PyQt6.QtGui import QPixmap, QIcon
-            qimage = ImageQt.ImageQt(img)
+            from PyQt6.QtGui import QPixmap, QIcon, QImage
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+            w, h = img.size
+            buf = img.tobytes()
+            qimage = QImage(buf, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
             pixmap = QPixmap.fromImage(qimage)
             item = QListWidgetItem()
             item.setIcon(QIcon(pixmap))

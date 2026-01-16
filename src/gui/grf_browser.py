@@ -44,6 +44,18 @@ except ImportError:
     PIL_AVAILABLE = False
     ImageDraw = None
 
+# Pillow/PyQt compatibility helper (see act_spr_editor.py for rationale)
+if PIL_AVAILABLE:
+    def _pil_to_qimage(pil_img):
+        try:
+            qimg = ImageQt(pil_img)
+        except Exception:
+            qimg = ImageQt.ImageQt(pil_img)
+        try:
+            return qimg.copy()
+        except Exception:
+            return qimg
+
 # Import GRF VFS
 try:
     from src.extractors.grf_vfs import GRFVirtualFileSystem, GRFFileEntry
@@ -239,7 +251,12 @@ class PreviewWorker(QThread):
                 self.error.emit(error_msg, self.file_path)
 
     def _process_spr(self, data: bytes, info_text: str):
-        """Process SPR sprite file - shows STATIC frame preview."""
+        """Process SPR.
+
+        Behavior:
+        - If matching .act exists (same basename), auto-load it so the preview can animate (manual-play).
+        - If no matching .act exists, show first frame as a static preview.
+        """
         if self._cancelled:
             return
 
@@ -250,46 +267,55 @@ class PreviewWorker(QThread):
                 return
 
             if sprite is None:
-                error_msg = "❌ SPR Parse Failed\n\nThe SPR file could not be parsed."
-                self.preview_text.emit(error_msg, info_text, self.file_path)
+                self.preview_text.emit("❌ SPR Parse Failed\n\nThe SPR file could not be parsed.", info_text, self.file_path)
                 return
 
             total_frames = sprite.get_total_frames()
-            if total_frames == 0:
-                error_msg = "❌ SPR has 0 frames"
-                self.preview_text.emit(error_msg, info_text, self.file_path)
+            if total_frames <= 0:
+                self.preview_text.emit("❌ SPR has 0 frames", info_text, self.file_path)
                 return
 
-            if self._cancelled:
-                return
+            # SPR details
+            info_text += "\n\nSPR Details:\n"
+            info_text += f"Total Frames: {sprite.get_total_frames()}\n"
+            info_text += f"Indexed: {sprite.get_indexed_count()}\n"
+            info_text += f"RGBA: {sprite.get_rgba_count()}\n"
 
-            # Render first frame
+            # Auto-load matching ACT if it exists
+            base = self.file_path.rsplit('.', 1)[0]
+            act_path = base + ".act"
+
+            if self.act_parser and self.vfs and self.vfs.file_exists(act_path):
+                act_bytes = self.vfs.read_file(act_path)
+                if act_bytes and not self._cancelled:
+                    act = self.act_parser.load_from_bytes(act_bytes)
+                    if act is not None and not self._cancelled:
+                        info_text += "\n\n✅ Auto-loaded ACT for animation:\n"
+                        info_text += f"{act_path}\n"
+                        info_text += f"Actions: {act.get_action_count()}\n"
+                        self.preview_act_ready.emit(act, sprite, info_text, self.file_path)
+                        return
+
+            # Fallback: static first frame
             img = sprite.get_frame_image(0)
-
-            if self._cancelled:
-                return
-
             if img:
-                # Add sprite details to info
-                info_text += f"\n\n📊 SPR Details:\n"
-                info_text += f"Total Frames: {sprite.get_total_frames()}\n"
-                info_text += f"Indexed: {sprite.get_indexed_count()}\n"
-                info_text += f"RGBA: {sprite.get_rgba_count()}\n"
-                info_text += f"\n💡 Note: SPR files contain STATIC frames.\n"
-                info_text += f"For animation, view the matching .act file."
+                info_text += "\n\n💡 Note: SPR files are frame containers.\n"
+                info_text += "For ACT-driven animation, select the matching .act."
                 self._emit_image(img, info_text)
             else:
-                error_msg = f"SPR: {total_frames} frames\n⚠️ Image rendering failed\n\n"
-                error_msg += "The sprite was parsed but the frame could not be rendered."
-                self.preview_text.emit(error_msg, info_text, self.file_path)
+                self.preview_text.emit(
+                    f"SPR: {total_frames} frames\n⚠️ Frame 0 render failed",
+                    info_text,
+                    self.file_path
+                )
 
         except Exception as e:
             if not self._cancelled:
                 import traceback
-                error_msg = f"❌ SPR Preview Error:\n{str(e)}"
+                msg = f"❌ SPR Preview Error:\n{str(e)}"
                 if self.debug_mode:
-                    error_msg += f"\n\n{traceback.format_exc()}"
-                self.preview_text.emit(error_msg, info_text, self.file_path)
+                    msg += f"\n\n{traceback.format_exc()}"
+                self.preview_text.emit(msg, info_text, self.file_path)
 
     def _process_act(self, data: bytes, info_text: str):
         """Process ACT action file."""
@@ -427,22 +453,31 @@ class GRFIndexingWorker(QThread):
             entries = list(self.archive.list_entries())
             total = len(entries)
             
+            print(f"[INFO] Indexing worker: Found {total} entries in archive")
+            
             if total == 0:
+                print("[WARN] Indexing worker: No entries found in archive")
                 self.finished.emit(False, {})
                 return
             
             # Build index with progress updates
             index = {}
             processed = 0
+            skipped = 0
             progress_interval = max(1, total // 100)  # Update every 1%
             
             for entry in entries:
                 if self._cancelled:
+                    print("[INFO] Indexing worker: Cancelled")
                     self.finished.emit(False, {})
                     return
                 
                 try:
                     normalized_path = entry.path
+                    if not normalized_path:
+                        skipped += 1
+                        continue
+                    
                     # Higher priority overrides lower
                     if normalized_path not in index:
                         index[normalized_path] = entry
@@ -458,17 +493,24 @@ class GRFIndexingWorker(QThread):
                         
                 except Exception as e:
                     # Skip invalid entry
+                    skipped += 1
+                    if skipped <= 5:  # Only print first few errors
+                        print(f"[WARN] Indexing worker: Skipped invalid entry: {e}")
                     continue
             
             if self._cancelled:
+                print("[INFO] Indexing worker: Cancelled after processing")
                 self.finished.emit(False, {})
                 return
+            
+            print(f"[INFO] Indexing worker: Processed {processed} entries, skipped {skipped}, index size: {len(index)}")
             
             # Return index data for UI thread
             self.finished.emit(True, index)
             
         except Exception as e:
             import traceback
+            print(f"[ERROR] Indexing worker exception: {e}")
             traceback.print_exc()
             self.finished.emit(False, {})
 
@@ -757,30 +799,73 @@ class GRFBrowserWidget(QWidget):
                 widget.setEnabled(True)
         
         if success and index:
+            # Debug logging
+            if self._debug_mode:
+                print(f"[DEBUG] Indexing finished: {len(index)} entries")
+                if len(index) > 0:
+                    sample_paths = list(index.keys())[:5]
+                    print(f"[DEBUG] Sample paths: {sample_paths}")
+            
             # Merge index into VFS
             if self.vfs._file_index:
                 # Merge with existing index (higher priority overrides)
                 self.vfs.merge_file_index(index)
+                if self._debug_mode:
+                    print(f"[DEBUG] Merged index, total files: {len(self.vfs._file_index)}")
             else:
                 # First GRF - set index directly
                 self.vfs.set_file_index(index)
+                if self._debug_mode:
+                    print(f"[DEBUG] Set initial index, total files: {len(self.vfs._file_index)}")
             
             file_count = len(self.vfs._file_index)
+            
+            if file_count == 0:
+                self.status_label.setText("Warning: GRF loaded but no files found in index")
+                QMessageBox.warning(self, "Warning", 
+                    f"GRF file loaded but no files were indexed.\n\n"
+                    f"This may indicate:\n"
+                    f"- The GRF file is empty\n"
+                    f"- The file table is corrupted\n"
+                    f"- There was an error during parsing\n\n"
+                    f"Check console output for details.")
+                self._current_archive = None
+                return
+            
             self.status_label.setText(f"Loaded {file_count:,} files")
+            
+            # Set current directory to root
+            self.current_directory = ""
             
             # Build tree incrementally (lazy loading)
             try:
                 self._build_tree_incremental()
+                
+                # Update file list for root directory
+                self._update_file_list()
+                
                 self._update_status()
+                
+                if self._debug_mode:
+                    print(f"[DEBUG] Tree built successfully, file list updated")
+                
                 QMessageBox.information(self, "Success", f"Loaded: {os.path.basename(grf_path)}\n\n{file_count:,} files indexed")
             except Exception as e:
                 import traceback
+                error_msg = f"Failed to build directory tree:\n{e}"
+                if self._debug_mode:
+                    print(f"[DEBUG] Tree build error:\n{traceback.format_exc()}")
                 traceback.print_exc()
-                QMessageBox.critical(self, "Error", f"Failed to build directory tree:\n{e}")
+                QMessageBox.critical(self, "Error", error_msg)
                 self.status_label.setText(f"Error building tree: {e}")
         else:
-            self.status_label.setText(f"Failed to index GRF")
-            QMessageBox.warning(self, "Error", f"Failed to index GRF:\n{grf_path}\n\nThe file may be corrupted or inaccessible.")
+            error_msg = f"Failed to index GRF:\n{grf_path}"
+            if self._debug_mode:
+                print(f"[DEBUG] Indexing failed: success={success}, index_size={len(index) if index else 0}")
+            self.status_label.setText("Failed to index GRF")
+            QMessageBox.warning(self, "Error", 
+                f"{error_msg}\n\nThe file may be corrupted or inaccessible.\n\n"
+                f"Check console output for details.")
             # Remove archive if indexing failed
             if self._current_archive and self._current_archive in self.vfs._archives:
                 self.vfs._archives.remove(self._current_archive)
@@ -817,6 +902,14 @@ class GRFBrowserWidget(QWidget):
     def _build_tree_incremental(self):
         """Build directory tree incrementally (only show top level first)."""
         if not self.vfs:
+            if self._debug_mode:
+                print("[DEBUG] Cannot build tree: VFS is None")
+            return
+        
+        if not self.vfs._file_index:
+            if self._debug_mode:
+                print("[DEBUG] Cannot build tree: File index is empty")
+            self.status_label.setText("No files in index - tree cannot be built")
             return
         
         try:
@@ -830,6 +923,10 @@ class GRFBrowserWidget(QWidget):
             
             # Process files in batches to avoid blocking
             file_count = len(self.vfs._file_index)
+            
+            if self._debug_mode:
+                print(f"[DEBUG] Building tree from {file_count:,} files")
+            
             processed = 0
             
             # Limit processing for very large GRFs to avoid crashes
@@ -868,6 +965,9 @@ class GRFBrowserWidget(QWidget):
                 item = QTreeWidgetItem(root, [f"📄 {file_name}"])
                 item.setData(0, Qt.ItemDataRole.UserRole, file_name)
             
+            if self._debug_mode:
+                print(f"[DEBUG] Tree built: {len(top_dirs)} directories, {len(top_files)} root files")
+            
             if file_count > max_process:
                 self.status_label.setText(f"Loaded {max_process:,}/{file_count:,} files (showing top-level only)")
             else:
@@ -875,8 +975,11 @@ class GRFBrowserWidget(QWidget):
                 
         except Exception as e:
             import traceback
+            error_msg = f"Error building tree: {e}"
+            if self._debug_mode:
+                print(f"[DEBUG] Tree build exception:\n{traceback.format_exc()}")
             traceback.print_exc()
-            self.status_label.setText(f"Error building tree: {e}")
+            self.status_label.setText(error_msg)
             QMessageBox.warning(self, "Warning", f"Directory tree partially built:\n{e}\n\nYou can still browse files using search.")
     
     def _build_tree(self):
@@ -961,49 +1064,93 @@ class GRFBrowserWidget(QWidget):
         selected = self.tree.selectedItems()
         if not selected:
             return
-        
+
         item = selected[0]
         path = item.data(0, Qt.ItemDataRole.UserRole)
+
+        if not path:
+            return
         
-        if path:
-            self.current_directory = path
-            self._update_file_list()
+        # Check if this is a file or directory
+        # Files don't end with '/' and exist in the file index
+        # Directories end with '/' or have children
+        is_directory = path.endswith('/') or path == ''
+        
+        # Also check if it's actually a file in the index
+        if not is_directory and self.vfs and path in self.vfs._file_index:
+            # It's a file - preview it instead of showing as directory
+            if self._debug_mode:
+                print(f"[DEBUG] Tree selection: File selected - {path}")
+            self._current_file_path = path
+            self._preview_file(path)
+            return
+        
+        # It's a directory - update file list
+        if self._debug_mode:
+            print(f"[DEBUG] Tree selection: Directory selected - {path}")
+        self.current_directory = path
+        self._update_file_list()
     
     def _update_file_list(self):
         """Update file list for current directory."""
         if not self.vfs:
+            if self._debug_mode:
+                print("[DEBUG] Cannot update file list: VFS is None")
             return
-        
+
+        if not self.vfs._file_index:
+            if self._debug_mode:
+                print("[DEBUG] Cannot update file list: File index is empty")
+            self.file_list.clear()
+            self.file_list.addItem(QListWidgetItem("(No files in index)"))
+            return
+
         self.file_list.clear()
-        
+
         # Get files in current directory
         files = []
         dir_path = self.current_directory
-        
-        if not dir_path.endswith('/'):
+
+        # Ensure directory path ends with '/' for proper matching
+        # But don't add '/' if it's empty (root directory)
+        if dir_path and not dir_path.endswith('/'):
             dir_path += '/'
-        
+
+        if self._debug_mode:
+            print(f"[DEBUG] Updating file list for directory: '{dir_path}'")
+
         for file_path in self.vfs._file_index.keys():
-            if file_path.startswith(dir_path):
+            # For root directory (empty string), match files that don't have '/' in them
+            if dir_path == '':
+                if '/' not in file_path:
+                    entry = self.vfs._file_index[file_path]
+                    files.append((file_path, entry))
+            elif file_path.startswith(dir_path):
                 # Get relative path
                 rel_path = file_path[len(dir_path):]
                 # Only show immediate children (not subdirectories)
                 if '/' not in rel_path:
                     entry = self.vfs._file_index[file_path]
                     files.append((rel_path, entry))
-        
+
         # Sort files
         files.sort(key=lambda x: x[0].lower())
-        
+
+        if self._debug_mode:
+            print(f"[DEBUG] Found {len(files)} files in directory")
+
         # Add to list
         for name, entry in files:
             # Format: "filename.ext (24 KB)"
             size_kb = entry.uncompressed_size / 1024
             size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
-            
+
             item = QListWidgetItem(f"{name} ({size_str})")
             item.setData(Qt.ItemDataRole.UserRole, entry.path)
             self.file_list.addItem(item)
+        
+        if len(files) == 0:
+            self.file_list.addItem(QListWidgetItem("(No files in this directory)"))
     
     def _on_file_selection_changed(self):
         """Handle file list selection change."""
@@ -1231,10 +1378,15 @@ class GRFBrowserWidget(QWidget):
             action = act_data.get_action(idx)
             frame_count = action.get_frame_count() if action else 0
             self.act_action_combo.addItem(f"Action {idx} ({frame_count} frames)", idx)
-        self.act_action_combo.setCurrentIndex(0)
+        # Pick a sensible default action (first drawable), not always Action 0.
+        best_action = self._find_first_drawable_action(act_data, spr_data)
+        combo_index = self.act_action_combo.findData(best_action)
+        if combo_index < 0:
+            combo_index = 0
+        self.act_action_combo.setCurrentIndex(combo_index)
         self.act_action_combo.blockSignals(False)
-        
-        self._act_preview_action_idx = 0
+
+        self._act_preview_action_idx = self.act_action_combo.currentData() or 0
         self._act_preview_frame_idx = 0
         
         # Pre-cache first few sprite frames to ensure render works
@@ -1242,6 +1394,37 @@ class GRFBrowserWidget(QWidget):
         
         # Now render
         self._render_act_preview_frame()
+
+    def _find_first_drawable_action(self, act_data, spr_data) -> int:
+        """Find the first action that references at least one valid sprite index.
+
+        Some archives have empty Action 0, or offsets that draw off-center.
+        This avoids starting on an action that renders nothing.
+        """
+        try:
+            indexed_count = spr_data.get_indexed_count()
+            total = spr_data.get_total_frames()
+            for a_idx in range(act_data.get_action_count()):
+                action = act_data.get_action(a_idx)
+                if not action or action.get_frame_count() <= 0:
+                    continue
+                # sample first few frames only (fast)
+                sample = min(5, action.get_frame_count())
+                for f_idx in range(sample):
+                    frame = action.get_frame(f_idx)
+                    if not frame:
+                        continue
+                    for layer in getattr(frame, "layers", []) or []:
+                        sidx = getattr(layer, "sprite_index", -1)
+                        if sidx is None or sidx < 0:
+                            continue
+                        if getattr(layer, "sprite_type", 0) == 1:
+                            sidx += indexed_count
+                        if 0 <= sidx < total:
+                            return a_idx
+        except Exception:
+            pass
+        return 0
     
     def _precache_sprite_frames(self, count: int):
         """Pre-cache sprite frames for smoother preview."""
@@ -1346,7 +1529,7 @@ class GRFBrowserWidget(QWidget):
         self._act_preview_timer.start(delay)
     
     def _render_act_preview_frame(self):
-        """Render current ACT preview frame."""
+        """Render current ACT preview frame (auto-fit bounds + checkerboard background)."""
         if not (self._act_preview_act and self._act_preview_sprite):
             return
         
@@ -1364,53 +1547,106 @@ class GRFBrowserWidget(QWidget):
             self.preview_label.setText("Invalid frame")
             return
         
-        # Composite layers onto a canvas
-        canvas_size = 512
-        canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-        center = canvas_size // 2
-        
-        for layer in frame.layers:
-            sprite_idx = layer.sprite_index
-            if sprite_idx < 0:
+        # Build tight bounds so we don't render off-canvas (this is why your preview was blank).
+        indexed_count = self._act_preview_sprite.get_indexed_count()
+        total_frames = self._act_preview_sprite.get_total_frames()
+
+        rendered = []
+        min_x = 10**9
+        min_y = 10**9
+        max_x = -10**9
+        max_y = -10**9
+
+        for layer in getattr(frame, "layers", []) or []:
+            sprite_idx = getattr(layer, "sprite_index", -1)
+            if sprite_idx is None or sprite_idx < 0:
                 continue
-            
-            if layer.sprite_type == 1:
-                sprite_idx += self._act_preview_sprite.get_indexed_count()
-            
-            if sprite_idx >= self._act_preview_sprite.get_total_frames():
+
+            if getattr(layer, "sprite_type", 0) == 1:
+                sprite_idx += indexed_count
+
+            if sprite_idx < 0 or sprite_idx >= total_frames:
                 continue
-            
-            # Use cached frame if available (performance optimization)
-            if sprite_idx in self._act_frame_cache:
-                img = self._act_frame_cache[sprite_idx]
-            else:
-                img = self._act_preview_sprite.get_frame_image(sprite_idx)
+
+            # Get sprite image (cache)
+            img = self._act_frame_cache.get(sprite_idx)
+            if img is None:
+                try:
+                    img = self._act_preview_sprite.get_frame_image(sprite_idx)
+                except Exception:
+                    img = None
                 if img is not None:
-                    # Cache the rendered frame for future use
                     self._act_frame_cache[sprite_idx] = img
-            
+
             if img is None:
                 continue
-            
+
             img = self._apply_layer_transforms(img, layer)
-            
-            x = center + layer.x - (img.width // 2)
-            y = center + layer.y - (img.height // 2)
+
+            # Treat layer (x,y) as centered position
+            left = int(getattr(layer, "x", 0) - (img.width // 2))
+            top = int(getattr(layer, "y", 0) - (img.height // 2))
+            right = left + img.width
+            bottom = top + img.height
+
+            min_x = min(min_x, left)
+            min_y = min(min_y, top)
+            max_x = max(max_x, right)
+            max_y = max(max_y, bottom)
+
+            rendered.append((img, left, top, sprite_idx, getattr(layer, "sprite_type", 0)))
+
+        if not rendered:
+            # Helpful debug when ACT references indices not in SPR or all layers are off
+            if self._debug_mode:
+                print(f"[DEBUG] ACT render: no drawable layers for action={self._act_preview_action_idx} frame={self._act_preview_frame_idx}")
+            self.preview_label.setText("No drawable layers (sprite indices out of range or empty frame)")
+            return
+
+        pad = 10
+        canvas_w = max(1, int(max_x - min_x) + pad * 2)
+        canvas_h = max(1, int(max_y - min_y) + pad * 2)
+
+        # Checkerboard background (ActEditor-like)
+        canvas = Image.new("RGBA", (canvas_w, canvas_h), (60, 60, 60, 255))
+        if ImageDraw:
+            draw_bg = ImageDraw.Draw(canvas)
+            tile = 16
+            c1 = (55, 55, 55, 255)
+            c2 = (75, 75, 75, 255)
+            for y in range(0, canvas_h, tile):
+                for x in range(0, canvas_w, tile):
+                    if ((x // tile) + (y // tile)) % 2 == 0:
+                        draw_bg.rectangle([x, y, x + tile - 1, y + tile - 1], fill=c1)
+                    else:
+                        draw_bg.rectangle([x, y, x + tile - 1, y + tile - 1], fill=c2)
+
+        origin_x = -min_x + pad
+        origin_y = -min_y + pad
+
+        for img, left, top, sprite_idx, spr_type in rendered:
+            x = int(origin_x + left)
+            y = int(origin_y + top)
             canvas.alpha_composite(img, (x, y))
-            
-            if self._act_debug_overlay_enabled:
+
+            if self._act_debug_overlay_enabled and ImageDraw:
                 draw = ImageDraw.Draw(canvas)
-                label = f"{sprite_idx} ({'RGBA' if layer.sprite_type == 1 else 'IDX'})"
+                label = f"{sprite_idx} ({'RGBA' if spr_type == 1 else 'IDX'})"
                 draw.rectangle([x, y, x + img.width, y + img.height], outline=(255, 255, 0, 200))
                 draw.text((x + 2, y + 2), label, fill=(255, 255, 0, 220))
         
         # Convert to QPixmap and display
         try:
-            qimage = ImageQt.ImageQt(canvas)
-            pixmap = QPixmap.fromImage(qimage)
+            # Avoid PIL.ImageQt (version mismatch issues). Use raw RGBA -> QImage.
+            if canvas.mode != "RGBA":
+                canvas = canvas.convert("RGBA")
+            w, h = canvas.size
+            buf = canvas.tobytes("raw", "RGBA")
+            qimg = QImage(buf, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+            pixmap = QPixmap.fromImage(qimg)
             
             # Scale if too large
-            max_size = 512
+            max_size = 800
             if pixmap.width() > max_size or pixmap.height() > max_size:
                 pixmap = pixmap.scaled(max_size, max_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             
@@ -1421,10 +1657,9 @@ class GRFBrowserWidget(QWidget):
     
     def _apply_layer_transforms(self, img: Image.Image, layer) -> Image.Image:
         """Apply layer transforms (width/height override, mirror, scale, rotation, color tint) to image."""
-        # Width/height override (if provided in ACT)
-        if getattr(layer, "width", 0) > 0 and getattr(layer, "height", 0) > 0:
-            img = img.resize((layer.width, layer.height), resample=Image.Resampling.BICUBIC)
-        
+        # NOTE: ACT v2.5 stores width/height fields, but GRFEditor/ActEditor override
+        # them with the real sprite dimensions for rendering. Resizing here causes distortion.
+
         # Mirror
         if getattr(layer, "mirror", False):
             img = ImageOps.mirror(img)
@@ -1433,14 +1668,14 @@ class GRFBrowserWidget(QWidget):
         scale_x = getattr(layer, "scale_x", 1.0)
         scale_y = getattr(layer, "scale_y", 1.0)
         if scale_x != 1.0 or scale_y != 1.0:
-            new_w = max(1, int(img.width * scale_x))
-            new_h = max(1, int(img.height * scale_y))
-            img = img.resize((new_w, new_h), resample=Image.Resampling.BICUBIC)
+            new_w = max(1, int(round(img.width * float(scale_x))))
+            new_h = max(1, int(round(img.height * float(scale_y))))
+            img = img.resize((new_w, new_h), resample=Image.Resampling.NEAREST)
         
         # Rotation (degrees)
-        rotation = getattr(layer, "rotation", 0)
+        rotation = int(getattr(layer, "rotation", 0) or 0)
         if rotation:
-            img = img.rotate(-rotation, expand=True, resample=Image.Resampling.BICUBIC)
+            img = img.rotate(-rotation, expand=True, resample=Image.Resampling.NEAREST)
         
         # Color tint (RGBA)
         color = getattr(layer, "color", (255, 255, 255, 255))

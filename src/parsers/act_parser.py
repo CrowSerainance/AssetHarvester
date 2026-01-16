@@ -52,6 +52,7 @@ ACT_SIGNATURE = b"AC"
 # ACT version constants
 ACT_VERSION_2_0 = (2, 0)  # Basic version
 ACT_VERSION_2_1 = (2, 1)  # Added sound events
+ACT_VERSION_2_2 = (2, 2)  # Added per-action animation speed (interval)
 ACT_VERSION_2_3 = (2, 3)  # Added more layer properties
 ACT_VERSION_2_4 = (2, 4)  # Added anchors
 ACT_VERSION_2_5 = (2, 5)  # Current version with all features
@@ -494,15 +495,12 @@ class ACTParser:
             # Read action count
             action_count = struct.unpack('<H', data[4:6])[0]
             
-            # Validate action count (should be reasonable - max ~200 actions for RO)
-            if action_count == 0 or action_count > 200:
-                # Invalid action count - might be corrupted data
+            # Validate action count (sanity)
+            if action_count > 200:
                 return None
             
-            # Skip reserved bytes (10 bytes of zeros in most versions)
-            offset = 6
-            if version >= ACT_VERSION_2_0:
-                offset = 16
+            # Skip reserved bytes (10 bytes of zeros)
+            offset = 16
             
             # Create ACT data object
             act_data = ACTData(version=version)
@@ -537,14 +535,39 @@ class ACTParser:
                 for i in range(event_count):
                     event_name, offset = self._read_string(data, offset, 40)
                     act_data.events.append(ACTEvent(name=event_name))
-            
-            # Read frame intervals if present
-            if version >= ACT_VERSION_2_3 and offset < len(data):
-                for action in act_data.actions:
+
+            # Read animation speed per action (ACT v2.2+)
+            # GRFEditor stores this as Action.AnimationSpeed, and the per-frame interval is (AnimationSpeed * 25ms).
+            if version >= ACT_VERSION_2_2 and offset < len(data):
+                speeds = []
+                last_speed = 1.0
+                for _ in act_data.actions:
                     if offset + 4 <= len(data):
-                        interval = struct.unpack('<f', data[offset:offset + 4])[0]
-                        act_data.frame_intervals.append(interval)
+                        last_speed = struct.unpack('<f', data[offset:offset + 4])[0]
                         offset += 4
+                    speeds.append(last_speed)
+
+                # Store per-action interval (ms) and also apply as default delay for every frame in that action
+                act_data.frame_intervals = []
+                for action, spd in zip(act_data.actions, speeds):
+                    try:
+                        interval_ms = float(spd) * 25.0
+                    except Exception:
+                        interval_ms = 25.0
+                    if interval_ms <= 0:
+                        interval_ms = 25.0
+                    act_data.frame_intervals.append(interval_ms)
+                    for fr in action.frames:
+                        fr.delay = interval_ms
+
+            # If no animation speeds exist (older versions or truncated tail), default to RO-ish interval (6 * 25ms = 150ms)
+            else:
+                default_interval = 150.0
+                act_data.frame_intervals = []
+                for action in act_data.actions:
+                    act_data.frame_intervals.append(default_interval)
+                    for fr in action.frames:
+                        fr.delay = default_interval
             
             return act_data
             
@@ -573,7 +596,7 @@ class ACTParser:
         if offset + 4 > len(data):
             raise struct.error(f"Not enough data for frame count at offset {offset}")
         
-        frame_count = struct.unpack('<I', data[offset:offset + 4])[0]
+        frame_count = struct.unpack('<i', data[offset:offset + 4])[0]
         offset += 4
         
         # CRITICAL: Validate frame count to prevent infinite loops
@@ -612,20 +635,25 @@ class ACTParser:
         """
         frame = ACTFrame()
         
-        # Validate offset for unknown data
-        if offset + 4 > len(data):
-            raise struct.error(f"Not enough data for frame header at offset {offset} (need 4 bytes, have {len(data) - offset})")
-        
-        # Skip unknown data (4 bytes in most versions)
-        offset += 4
+        # Validate offset for frame header / padding block
+        if offset + 32 > len(data):
+            raise struct.error(
+                f"Not enough data for frame padding at offset {offset} (need 32 bytes, have {len(data) - offset})"
+            )
+
+        # Skip frame padding block (32 bytes)
+        offset += 32
         
         # Validate offset for layer count
         if offset + 4 > len(data):
             raise struct.error(f"Not enough data for layer count at offset {offset} (need 4 bytes, have {len(data) - offset})")
         
         # Read layer count
-        layer_count = struct.unpack('<I', data[offset:offset + 4])[0]
+        layer_count = struct.unpack('<i', data[offset:offset + 4])[0]
         offset += 4
+
+        if layer_count < 0:
+            raise ValueError(f"Invalid layer count: {layer_count}")
         
         # Validate layer count (sanity check - max reasonable is ~50 layers per frame)
         if layer_count > 100:
@@ -648,22 +676,29 @@ class ACTParser:
             frame.event_id = struct.unpack('<i', data[offset:offset + 4])[0]
             offset += 4
         
-        # Read anchors (version 2.4+)
-        if version >= ACT_VERSION_2_4:
-            anchor_count = struct.unpack('<I', data[offset:offset + 4])[0]
-            offset += 4
-            
-            for i in range(anchor_count):
-                # Each anchor: unknown (4 bytes) + x (4 bytes) + y (4 bytes) + attr (4 bytes)
-                offset += 4  # Skip unknown
-                x = struct.unpack('<i', data[offset:offset + 4])[0]
+        # Anchors (ACT v2.3+)
+        if version >= ACT_VERSION_2_3:
+            # Anchor section begins with an int32 count
+            if offset + 4 <= len(data):
+                anchor_count = struct.unpack('<I', data[offset:offset + 4])[0]
                 offset += 4
-                y = struct.unpack('<i', data[offset:offset + 4])[0]
-                offset += 4
-                attr = struct.unpack('<i', data[offset:offset + 4])[0]
-                offset += 4
-                
-                frame.anchors.append(ACTAnchor(x=x, y=y, attr=attr))
+
+                # Sanity cap
+                if anchor_count > 2000:
+                    anchor_count = 0
+
+                for _ in range(anchor_count):
+                    # Each anchor: 4 bytes unknown + x(int32) + y(int32) + other(int32)
+                    if offset + 16 > len(data):
+                        break
+                    offset += 4  # unknown
+                    x = struct.unpack('<i', data[offset:offset + 4])[0]
+                    offset += 4
+                    y = struct.unpack('<i', data[offset:offset + 4])[0]
+                    offset += 4
+                    other = struct.unpack('<i', data[offset:offset + 4])[0]
+                    offset += 4
+                    frame.anchors.append(ACTAnchor(x=x, y=y, attr=other))
         
         return frame, offset
     
@@ -713,57 +748,70 @@ class ACTParser:
         
         # Version 2.0+ has additional properties
         if version >= ACT_VERSION_2_0:
-            # Read color (RGBA, 4 bytes)
+            # Color (RGBA, 4 bytes)
             if offset + 4 > len(data):
-                raise struct.error(f"Not enough data for layer.color at offset {offset} (need 4 bytes, have {len(data) - offset})")
-            
+                raise struct.error(
+                    f"Not enough data for layer.color at offset {offset} (need 4 bytes, have {len(data) - offset})"
+                )
+
             r = data[offset]
             g = data[offset + 1]
             b = data[offset + 2]
             a = data[offset + 3]
             layer.color = (r, g, b, a)
             offset += 4
-            
-            # Read scale (x, y as float32)
+
+            # ScaleX (float32)
             if offset + 4 > len(data):
-                raise struct.error(f"Not enough data for layer.scale_x at offset {offset} (need 4 bytes, have {len(data) - offset})")
-            
+                raise struct.error(
+                    f"Not enough data for layer.scale_x at offset {offset} (need 4 bytes, have {len(data) - offset})"
+                )
+
             layer.scale_x = struct.unpack('<f', data[offset:offset + 4])[0]
             offset += 4
-            
-            if offset + 4 > len(data):
-                raise struct.error(f"Not enough data for layer.scale_y at offset {offset} (need 4 bytes, have {len(data) - offset})")
-            
-            layer.scale_y = struct.unpack('<f', data[offset:offset + 4])[0]
-            offset += 4
-            
+
+            # ScaleY:
+            # - Versions 2.0–2.3 do NOT store ScaleY; it is identical to ScaleX
+            # - Version 2.4+ stores ScaleY as an additional float32
+            layer.scale_y = layer.scale_x
+            if version >= ACT_VERSION_2_4:
+                if offset + 4 > len(data):
+                    raise struct.error(
+                        f"Not enough data for layer.scale_y at offset {offset} (need 4 bytes, have {len(data) - offset})"
+                    )
+
+                layer.scale_y = struct.unpack('<f', data[offset:offset + 4])[0]
+                offset += 4
+
             # Read rotation (int32, degrees)
             if offset + 4 > len(data):
-                raise struct.error(f"Not enough data for layer.rotation at offset {offset} (need 4 bytes, have {len(data) - offset})")
-            
+                raise struct.error(
+                    f"Not enough data for layer.rotation at offset {offset} (need 4 bytes, have {len(data) - offset})"
+                )
+
             layer.rotation = struct.unpack('<i', data[offset:offset + 4])[0]
             offset += 4
-            
+
             # Read sprite type (int32, 0 = indexed, 1 = rgba)
             if offset + 4 > len(data):
-                raise struct.error(f"Not enough data for layer.sprite_type at offset {offset} (need 4 bytes, have {len(data) - offset})")
-            
+                raise struct.error(
+                    f"Not enough data for layer.sprite_type at offset {offset} (need 4 bytes, have {len(data) - offset})"
+                )
+
             layer.sprite_type = struct.unpack('<i', data[offset:offset + 4])[0]
             offset += 4
-        
-        # Version 2.3+ has width/height
-        if version >= ACT_VERSION_2_3:
-            if offset + 4 > len(data):
-                raise struct.error(f"Not enough data for layer.width at offset {offset} (need 4 bytes, have {len(data) - offset})")
-            
-            layer.width = struct.unpack('<i', data[offset:offset + 4])[0]
-            offset += 4
-            
-            if offset + 4 > len(data):
-                raise struct.error(f"Not enough data for layer.height at offset {offset} (need 4 bytes, have {len(data) - offset})")
-            
-            layer.height = struct.unpack('<i', data[offset:offset + 4])[0]
-            offset += 4
+
+            # Version 2.5+ has width/height fields (but many renderers override these with real sprite size)
+            if version >= ACT_VERSION_2_5:
+                if offset + 8 > len(data):
+                    raise struct.error(
+                        f"Not enough data for layer.width/height at offset {offset} (need 8 bytes, have {len(data) - offset})"
+                    )
+
+                layer.width = struct.unpack('<i', data[offset:offset + 4])[0]
+                offset += 4
+                layer.height = struct.unpack('<i', data[offset:offset + 4])[0]
+                offset += 4
         
         return layer, offset
     
