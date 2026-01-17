@@ -27,10 +27,11 @@ try:
         QGroupBox, QLabel, QPushButton, QLineEdit, QFileDialog,
         QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem,
         QSplitter, QTextEdit, QMessageBox, QMenu, QProgressDialog,
-        QFrame, QScrollArea, QProgressBar, QApplication, QComboBox, QDoubleSpinBox, QCheckBox
+        QFrame, QScrollArea, QProgressBar, QApplication, QComboBox, QDoubleSpinBox, QCheckBox,
+        QSlider, QToolButton, QDialog
     )
     from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThread, QTimer
-    from PyQt6.QtGui import QImage, QPixmap, QPainter, QAction, QIcon
+    from PyQt6.QtGui import QImage, QPixmap, QPainter, QAction, QIcon, QWheelEvent, QMouseEvent
     PYQT_AVAILABLE = True
 except ImportError:
     PYQT_AVAILABLE = False
@@ -55,6 +56,138 @@ if PIL_AVAILABLE:
             return qimg.copy()
         except Exception:
             return qimg
+
+# ==============================================================================
+# Canvas Preview Widget (ActEditor-like: zoom/pan + fit-to-view + fixed origin)
+# ==============================================================================
+class CanvasPreviewWidget(QWidget):
+    """
+    Lightweight canvas widget:
+      - Wheel zoom, pan by dragging
+      - Fit-to-view
+      - Optional fixed-origin crosshair (best for motion offsets)
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(400, 300)
+        self.setMouseTracking(True)
+        self._pixmap: Optional[QPixmap] = None
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._dragging = False
+        self._drag_last = None
+        self._show_fixed_origin = False
+        self._bg_checker = True
+
+    def set_pixmap(self, pm: Optional[QPixmap]):
+        self._pixmap = pm
+        self.update()
+
+    def clear(self):
+        self._pixmap = None
+        self.update()
+
+    def set_fixed_origin(self, enabled: bool):
+        self._show_fixed_origin = bool(enabled)
+        self.update()
+
+    def set_checkerboard(self, enabled: bool):
+        self._bg_checker = bool(enabled)
+        self.update()
+
+    def reset_view(self):
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self.update()
+
+    def fit_to_view(self):
+        if not self._pixmap or self._pixmap.isNull():
+            return
+        vw = max(1, self.width())
+        vh = max(1, self.height())
+        pw = max(1, self._pixmap.width())
+        ph = max(1, self._pixmap.height())
+        sx = vw / pw
+        sy = vh / ph
+        self._zoom = max(0.05, min(sx, sy))
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self.update()
+
+    def wheelEvent(self, e: 'QWheelEvent'):
+        if not self._pixmap or self._pixmap.isNull():
+            return
+        delta = e.angleDelta().y()
+        if delta == 0:
+            return
+        old_zoom = self._zoom
+        factor = 1.15 if delta > 0 else (1.0 / 1.15)
+        new_zoom = max(0.05, min(32.0, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+        cx = e.position().x() - (self.width() / 2.0) - self._pan_x
+        cy = e.position().y() - (self.height() / 2.0) - self._pan_y
+        scale = new_zoom / old_zoom
+        self._pan_x -= cx * (scale - 1.0)
+        self._pan_y -= cy * (scale - 1.0)
+        self._zoom = new_zoom
+        self.update()
+
+    def mousePressEvent(self, e: 'QMouseEvent'):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._drag_last = e.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e: 'QMouseEvent'):
+        if self._dragging and self._drag_last is not None:
+            cur = e.position()
+            dx = cur.x() - self._drag_last.x()
+            dy = cur.y() - self._drag_last.y()
+            self._pan_x += dx
+            self._pan_y += dy
+            self._drag_last = cur
+            self.update()
+
+    def mouseReleaseEvent(self, e: 'QMouseEvent'):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self._drag_last = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        if self._bg_checker:
+            tile = 16
+            c1 = self.palette().color(self.backgroundRole())
+            c2 = self.palette().color(self.backgroundRole()).darker(110)
+            for y in range(0, self.height(), tile):
+                for x in range(0, self.width(), tile):
+                    p.fillRect(x, y, tile, tile, c1 if ((x // tile + y // tile) % 2 == 0) else c2)
+        else:
+            p.fillRect(0, 0, self.width(), self.height(), self.palette().color(self.backgroundRole()))
+
+        if self._pixmap and not self._pixmap.isNull():
+            cx = self.width() / 2.0 + self._pan_x
+            cy = self.height() / 2.0 + self._pan_y
+            w = self._pixmap.width() * self._zoom
+            h = self._pixmap.height() * self._zoom
+            x = cx - (w / 2.0)
+            y = cy - (h / 2.0)
+            p.drawPixmap(int(x), int(y), int(w), int(h), self._pixmap)
+
+        if self._show_fixed_origin:
+            midx = int(self.width() / 2)
+            midy = int(self.height() / 2)
+            p.setPen(self.palette().color(self.foregroundRole()))
+            p.drawLine(midx - 12, midy, midx + 12, midy)
+            p.drawLine(midx, midy - 12, midx, midy + 12)
+            p.drawRect(midx - 1, midy - 1, 2, 2)
 
 # Import GRF VFS
 try:
@@ -636,14 +769,41 @@ class GRFBrowserWidget(QWidget):
         # === RIGHT: Preview ===
         preview_group = QGroupBox("👁️ Preview")
         preview_layout = QVBoxLayout(preview_group)
-        
-        self.preview_area = QScrollArea()
-        self.preview_area.setWidgetResizable(True)
+
+        # --- ActEditor-like preview: Canvas (zoom/pan/fit) + controls ---
+        self.preview_canvas = CanvasPreviewWidget()
+        self.preview_canvas.set_checkerboard(True)
+        preview_layout.addWidget(self.preview_canvas)
+
+        # Legacy text preview label (not added to layout; kept to avoid attribute errors)
         self.preview_label = QLabel("No file selected")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(400, 300)
-        self.preview_area.setWidget(self.preview_label)
-        preview_layout.addWidget(self.preview_area)
+
+        canvas_controls = QHBoxLayout()
+        self.btn_fit = QToolButton()
+        self.btn_fit.setText("Fit")
+        self.btn_fit.setToolTip("Fit image to view")
+        self.btn_fit.clicked.connect(lambda: self.preview_canvas.fit_to_view())
+        canvas_controls.addWidget(self.btn_fit)
+
+        self.btn_reset_view = QToolButton()
+        self.btn_reset_view.setText("1:1")
+        self.btn_reset_view.setToolTip("Reset zoom/pan")
+        self.btn_reset_view.clicked.connect(lambda: self.preview_canvas.reset_view())
+        canvas_controls.addWidget(self.btn_reset_view)
+
+        self.fixed_origin_check = QCheckBox("Fixed origin")
+        self.fixed_origin_check.setToolTip("Show crosshair at canvas center (useful for motion offsets)")
+        self.fixed_origin_check.toggled.connect(self._on_fixed_origin_toggled)
+        canvas_controls.addWidget(self.fixed_origin_check)
+
+        self.btn_sprite_sheet = QToolButton()
+        self.btn_sprite_sheet.setText("Sprite Sheet")
+        self.btn_sprite_sheet.setToolTip("Open sprite sheet viewer for SPR frames")
+        self.btn_sprite_sheet.clicked.connect(self._open_sprite_sheet_viewer)
+        canvas_controls.addWidget(self.btn_sprite_sheet)
+
+        canvas_controls.addStretch()
+        preview_layout.addLayout(canvas_controls)
         
         # ACT preview controls (animation)
         self.act_preview_controls = QHBoxLayout()
@@ -666,9 +826,42 @@ class GRFBrowserWidget(QWidget):
         self.act_debug_overlay = QCheckBox("Debug overlay")
         self.act_debug_overlay.toggled.connect(self._on_act_debug_toggled)
         self.act_preview_controls.addWidget(self.act_debug_overlay)
-        
+
+        self.act_show_spr_only = QCheckBox("SPR frame only")
+        self.act_show_spr_only.setToolTip("When enabled: selecting a thumbnail shows that SPR frame only (no ACT compositing)")
+        self.act_show_spr_only.toggled.connect(self._on_act_spr_only_toggled)
+        self.act_preview_controls.addWidget(self.act_show_spr_only)
+
         self.act_preview_controls.addStretch()
         preview_layout.addLayout(self.act_preview_controls)
+
+        timeline_row = QHBoxLayout()
+        timeline_row.addWidget(QLabel("Frame:"))
+        self.act_frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.act_frame_slider.setMinimum(0)
+        self.act_frame_slider.setMaximum(0)
+        self.act_frame_slider.setSingleStep(1)
+        self.act_frame_slider.setPageStep(1)
+        self.act_frame_slider.valueChanged.connect(self._on_act_frame_slider_changed)
+        timeline_row.addWidget(self.act_frame_slider)
+        self.act_frame_label = QLabel("0 / 0")
+        self.act_frame_label.setMinimumWidth(72)
+        timeline_row.addWidget(self.act_frame_label)
+        preview_layout.addLayout(timeline_row)
+
+        self.act_thumb_strip = QListWidget()
+        self.act_thumb_strip.setViewMode(QListWidget.ViewMode.IconMode)
+        self.act_thumb_strip.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.act_thumb_strip.setMovement(QListWidget.Movement.Static)
+        self.act_thumb_strip.setWrapping(False)
+        # Give more distance / breathing room between per-frame thumbnails (ActEditor-like strip)
+        self.act_thumb_strip.setIconSize(QSize(56, 56))
+        # Grid size controls item spacing much more reliably than setSpacing alone
+        self.act_thumb_strip.setGridSize(QSize(72, 88))
+        self.act_thumb_strip.setMinimumHeight(96)
+        self.act_thumb_strip.setSpacing(10)
+        self.act_thumb_strip.itemSelectionChanged.connect(self._on_act_thumbnail_selected)
+        preview_layout.addWidget(self.act_thumb_strip)
         
         # File info
         self.file_info = QLabel("")
@@ -713,6 +906,13 @@ class GRFBrowserWidget(QWidget):
         self._act_debug_overlay_enabled = False
         self._act_frame_cache = {}  # Cache rendered SPR frames: {sprite_idx: Image}
         self._preview_img_bytes = None  # Keep reference for QImage byte lifetime
+
+        # ActEditor-like UI state
+        self._act_selected_spr_idx: Optional[int] = None
+        self._act_thumb_timer = QTimer(self)
+        self._act_thumb_timer.timeout.connect(self._build_thumbnails_tick)
+        self._act_thumb_pending: List[int] = []
+        self._act_thumb_icon_cache: Dict[int, QIcon] = {}
     
     def load_grf(self, grf_path: str, priority: int = 0) -> bool:
         """
@@ -1318,8 +1518,9 @@ class GRFBrowserWidget(QWidget):
                                        Qt.AspectRatioMode.KeepAspectRatio, 
                                        Qt.TransformationMode.SmoothTransformation)
 
-            self.preview_label.setPixmap(pixmap)
-            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.preview_canvas.set_pixmap(pixmap)
+            # Default to 1:1 (user requested). Fit is manual.
+            self.preview_canvas.reset_view()
             self.file_info.setText(info_text)
             
         except Exception as e:
@@ -1336,8 +1537,7 @@ class GRFBrowserWidget(QWidget):
         if file_path != self._current_file_path:
             return
 
-        self.preview_label.setText(text)
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.preview_canvas.set_pixmap(None)
         self.file_info.setText(info_text)
 
     def _on_preview_error(self, error_msg: str, file_path: str):
@@ -1346,8 +1546,7 @@ class GRFBrowserWidget(QWidget):
         if file_path != self._current_file_path:
             return
         
-        self.preview_label.setText(error_msg)
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.preview_canvas.set_pixmap(None)
         self.file_info.setText("Error - see preview for details")
     
     def _on_act_preview_ready(self, act_data, spr_data, info_text: str, file_path: str):
@@ -1368,7 +1567,7 @@ class GRFBrowserWidget(QWidget):
             error_msg = "❌ SPR has no frames - cannot preview ACT"
             if self._debug_mode:
                 print(f"[DEBUG] ACT preview failed: {error_msg}")
-            self.preview_label.setText(error_msg)
+            self.preview_canvas.set_pixmap(None)
             return
         
         # Populate action combo with frame counts
@@ -1391,6 +1590,9 @@ class GRFBrowserWidget(QWidget):
         
         # Pre-cache first few sprite frames to ensure render works
         self._precache_sprite_frames(5)
+
+        # Sync slider/thumbs at load time (requires spr_data)
+        self._sync_act_timeline_and_thumbs_on_load()
         
         # Now render
         self._render_act_preview_frame()
@@ -1425,6 +1627,328 @@ class GRFBrowserWidget(QWidget):
         except Exception:
             pass
         return 0
+
+    # ==============================================================================
+    # Canvas preview + ActEditor-like controls
+    # ==============================================================================
+    def _on_fixed_origin_toggled(self, checked: bool):
+        self.preview_canvas.set_fixed_origin(bool(checked))
+        if self._act_preview_act and self._act_preview_sprite:
+            self._render_act_preview_frame()
+
+    def _on_act_spr_only_toggled(self, checked: bool):
+        self._act_selected_spr_idx = None
+        self._render_act_preview_frame()
+
+    def _on_act_frame_slider_changed(self, value: int):
+        if not self._act_preview_sprite:
+            return
+        total = self._act_preview_sprite.get_total_frames()
+        if total <= 0:
+            return
+        v = max(0, min(int(value), total - 1))
+        self._act_selected_spr_idx = v
+        self._update_act_frame_label()
+        self._select_thumbnail_index(v, from_slider=True)
+        self._render_selected_spr_frame_only(v)
+
+        # If user scrubs while playing, stop playback (ActEditor-like behavior)
+        if getattr(self, "_act_preview_playing", False):
+            self._act_preview_playing = False
+            try:
+                self._act_preview_timer.stop()
+            except Exception:
+                pass
+            try:
+                self.act_play_btn.setText("▶ Play")
+            except Exception:
+                pass
+
+    def _on_act_thumbnail_selected(self):
+        if not self._act_preview_sprite:
+            return
+        items = self.act_thumb_strip.selectedItems()
+        if not items:
+            return
+        idx = items[0].data(Qt.ItemDataRole.UserRole)
+        if idx is None:
+            return
+        try:
+            idx = int(idx)
+        except Exception:
+            return
+        self._act_selected_spr_idx = idx
+        self._update_act_frame_label()
+        self.act_frame_slider.blockSignals(True)
+        self.act_frame_slider.setValue(idx)
+        self.act_frame_slider.blockSignals(False)
+        self._render_selected_spr_frame_only(idx)
+
+        # If user clicks a thumbnail while playing, stop playback
+        if getattr(self, "_act_preview_playing", False):
+            self._act_preview_playing = False
+            try:
+                self._act_preview_timer.stop()
+            except Exception:
+                pass
+            try:
+                self.act_play_btn.setText("▶ Play")
+            except Exception:
+                pass
+
+    def _update_act_frame_label(self):
+        if not self._act_preview_sprite:
+            self.act_frame_label.setText("0 / 0")
+            return
+        total = int(self._act_preview_sprite.get_total_frames() or 0)
+        cur = int(self._act_selected_spr_idx or 0)
+        if total <= 0:
+            self.act_frame_label.setText("0 / 0")
+        else:
+            self.act_frame_label.setText(f"{cur} / {max(0, total - 1)}")
+
+    def _select_thumbnail_index(self, idx: int, from_slider: bool = False):
+        if idx < 0 or idx >= self.act_thumb_strip.count():
+            return
+        self.act_thumb_strip.blockSignals(True)
+        self.act_thumb_strip.setCurrentRow(idx)
+        self.act_thumb_strip.blockSignals(False)
+        item = self.act_thumb_strip.item(idx)
+        if item:
+            self.act_thumb_strip.scrollToItem(item)
+
+    def _sync_act_timeline_and_thumbs_on_load(self):
+        if not self._act_preview_sprite:
+            self.act_frame_slider.setMinimum(0)
+            self.act_frame_slider.setMaximum(0)
+            self.act_thumb_strip.clear()
+            self.act_frame_label.setText("0 / 0")
+            return
+
+        total = int(self._act_preview_sprite.get_total_frames() or 0)
+        if total <= 0:
+            self.act_frame_slider.setMinimum(0)
+            self.act_frame_slider.setMaximum(0)
+            self.act_thumb_strip.clear()
+            self.act_frame_label.setText("0 / 0")
+            return
+
+        self.act_frame_slider.blockSignals(True)
+        self.act_frame_slider.setMinimum(0)
+        self.act_frame_slider.setMaximum(total - 1)
+        self.act_frame_slider.setValue(0)
+        self.act_frame_slider.blockSignals(False)
+
+        self._act_selected_spr_idx = 0
+        self._update_act_frame_label()
+
+        self._act_thumb_icon_cache.clear()
+        self.act_thumb_strip.clear()
+        self._act_thumb_pending = list(range(total))
+        for i in range(total):
+            it = QListWidgetItem(str(i))
+            it.setData(Qt.ItemDataRole.UserRole, i)
+            it.setToolTip(f"SPR frame {i}")
+            self.act_thumb_strip.addItem(it)
+        self._act_thumb_timer.stop()
+        self._act_thumb_timer.start(5)
+
+        self._select_thumbnail_index(0)
+
+        # IMPORTANT: default to 1:1 on load (user requested)
+        self.preview_canvas.reset_view()
+
+    def _build_thumbnails_tick(self):
+        if not self._act_preview_sprite or not PIL_AVAILABLE:
+            self._act_thumb_timer.stop()
+            return
+        if not self._act_thumb_pending:
+            self._act_thumb_timer.stop()
+            return
+
+        batch = 12
+        total = int(self._act_preview_sprite.get_total_frames() or 0)
+        for _ in range(batch):
+            if not self._act_thumb_pending:
+                break
+            idx = self._act_thumb_pending.pop(0)
+            if idx < 0 or idx >= total:
+                continue
+            if idx in self._act_thumb_icon_cache:
+                continue
+            try:
+                pil_img = self._act_preview_sprite.get_frame_image(idx)
+                if pil_img is None:
+                    continue
+                thumb = pil_img.convert("RGBA")
+                thumb.thumbnail((48, 48), Image.Resampling.NEAREST)
+                pm = self._pil_to_qpixmap(thumb)
+                ico = QIcon(pm)
+                self._act_thumb_icon_cache[idx] = ico
+                item = self.act_thumb_strip.item(idx)
+                if item:
+                    item.setIcon(ico)
+            except Exception:
+                continue
+
+    def _render_selected_spr_frame_only(self, spr_idx: int):
+        if not self._act_preview_sprite or not PIL_AVAILABLE:
+            return
+        total = int(self._act_preview_sprite.get_total_frames() or 0)
+        if spr_idx < 0 or spr_idx >= total:
+            return
+        try:
+            pil_img = self._act_preview_sprite.get_frame_image(spr_idx)
+            if pil_img is None:
+                self.preview_canvas.set_pixmap(None)
+                return
+            pm = self._pil_to_qpixmap(pil_img.convert("RGBA"))
+            self.preview_canvas.set_pixmap(pm)
+            # Default to 1:1 (user requested). Fit is manual.
+            self.preview_canvas.reset_view()
+        except Exception as e:
+            if self._debug_mode:
+                print(f"[DEBUG] SPR frame render error: {e}")
+
+    def _open_sprite_sheet_viewer(self):
+        if not self._act_preview_sprite or not PIL_AVAILABLE:
+            QMessageBox.information(self, "Sprite Sheet", "No SPR loaded (preview an ACT with matching SPR first).")
+            return
+        total = int(self._act_preview_sprite.get_total_frames() or 0)
+        if total <= 0:
+            QMessageBox.information(self, "Sprite Sheet", "SPR has 0 frames.")
+            return
+        try:
+            cell = 64
+            cols = 12
+            rows = (total + cols - 1) // cols
+            sheet = Image.new("RGBA", (cols * cell, rows * cell), (0, 0, 0, 0))
+            for i in range(total):
+                img = self._act_preview_sprite.get_frame_image(i)
+                if img is None:
+                    continue
+                t = img.convert("RGBA")
+                t.thumbnail((cell, cell), Image.Resampling.NEAREST)
+                x = (i % cols) * cell + (cell - t.width) // 2
+                y = (i // cols) * cell + (cell - t.height) // 2
+                sheet.alpha_composite(t, (x, y))
+
+            pm = self._pil_to_qpixmap(sheet)
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Sprite Sheet Viewer (SPR Frames)")
+            dlg.resize(900, 600)
+            v = QVBoxLayout(dlg)
+            sa = QScrollArea()
+            sa.setWidgetResizable(True)
+            lbl = QLabel()
+            lbl.setPixmap(pm)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            sa.setWidget(lbl)
+            v.addWidget(sa)
+            dlg.exec()
+        except Exception as e:
+            QMessageBox.warning(self, "Sprite Sheet", f"Failed to build sprite sheet:\n{e}")
+
+    def _pil_to_qpixmap(self, pil_img: 'Image.Image') -> QPixmap:
+        if pil_img is None:
+            return QPixmap()
+        img = pil_img.convert("RGBA")
+        w, h = img.size
+        buf = img.tobytes("raw", "RGBA")
+        qimg = QImage(buf, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+        return QPixmap.fromImage(qimg)
+
+    def _render_act_frame_pil(self, action_idx: int, act_frame_idx: int, fixed_origin: bool = False) -> Optional['Image.Image']:
+        if not (self._act_preview_act and self._act_preview_sprite and PIL_AVAILABLE):
+            return None
+        action = self._act_preview_act.get_action(action_idx)
+        if not action or action.get_frame_count() <= 0:
+            return None
+        frame = action.get_frame(act_frame_idx)
+        if not frame:
+            return None
+
+        indexed_count = self._act_preview_sprite.get_indexed_count()
+        total_frames = self._act_preview_sprite.get_total_frames()
+
+        rendered = []
+        min_x = 10**9
+        min_y = 10**9
+        max_x = -10**9
+        max_y = -10**9
+
+        for layer in getattr(frame, "layers", []) or []:
+            sprite_idx = getattr(layer, "sprite_index", -1)
+            if sprite_idx is None or sprite_idx < 0:
+                continue
+            if getattr(layer, "sprite_type", 0) == 1:
+                sprite_idx += indexed_count
+            if sprite_idx < 0 or sprite_idx >= total_frames:
+                continue
+
+            img = self._act_frame_cache.get(sprite_idx)
+            if img is None:
+                try:
+                    img = self._act_preview_sprite.get_frame_image(sprite_idx)
+                except Exception:
+                    img = None
+                if img is not None:
+                    self._act_frame_cache[sprite_idx] = img
+            if img is None:
+                continue
+
+            img = self._apply_layer_transforms(img, layer)
+            left = int(getattr(layer, "x", 0) - (img.width // 2))
+            top = int(getattr(layer, "y", 0) - (img.height // 2))
+            right = left + img.width
+            bottom = top + img.height
+
+            min_x = min(min_x, left)
+            min_y = min(min_y, top)
+            max_x = max(max_x, right)
+            max_y = max(max_y, bottom)
+            rendered.append((img, left, top, sprite_idx, getattr(layer, "sprite_type", 0)))
+
+        if not rendered:
+            return None
+
+        pad = 10
+        if fixed_origin:
+            canvas_w, canvas_h = 512, 512
+            origin_x = canvas_w // 2
+            origin_y = canvas_h // 2
+            canvas = Image.new("RGBA", (canvas_w, canvas_h), (60, 60, 60, 255))
+        else:
+            canvas_w = max(1, int(max_x - min_x) + pad * 2)
+            canvas_h = max(1, int(max_y - min_y) + pad * 2)
+            origin_x = -min_x + pad
+            origin_y = -min_y + pad
+            canvas = Image.new("RGBA", (canvas_w, canvas_h), (60, 60, 60, 255))
+
+        if ImageDraw:
+            draw_bg = ImageDraw.Draw(canvas)
+            tile = 16
+            c1 = (55, 55, 55, 255)
+            c2 = (75, 75, 75, 255)
+            for y in range(0, canvas_h, tile):
+                for x in range(0, canvas_w, tile):
+                    draw_bg.rectangle([x, y, x + tile - 1, y + tile - 1],
+                                      fill=(c1 if ((x // tile) + (y // tile)) % 2 == 0 else c2))
+            if fixed_origin:
+                draw_bg.line([origin_x - 12, origin_y, origin_x + 12, origin_y], fill=(220, 220, 220, 180))
+                draw_bg.line([origin_x, origin_y - 12, origin_x, origin_y + 12], fill=(220, 220, 220, 180))
+
+        for img, left, top, sprite_idx, spr_type in rendered:
+            x = int(origin_x + left)
+            y = int(origin_y + top)
+            canvas.alpha_composite(img, (x, y))
+            if self._act_debug_overlay_enabled and ImageDraw:
+                d = ImageDraw.Draw(canvas)
+                label = f"{sprite_idx} ({'RGBA' if spr_type == 1 else 'IDX'})"
+                d.rectangle([x, y, x + img.width, y + img.height], outline=(255, 255, 0, 200))
+                d.text((x + 2, y + 2), label, fill=(255, 255, 0, 220))
+
+        return canvas
     
     def _precache_sprite_frames(self, count: int):
         """Pre-cache sprite frames for smoother preview."""
@@ -1465,17 +1989,49 @@ class GRFBrowserWidget(QWidget):
         self._act_debug_overlay_enabled = False
         self.act_debug_overlay.setChecked(False)
         self._act_frame_cache.clear()  # Clear cache when resetting
+        self._act_selected_spr_idx = None
+        self.act_frame_slider.blockSignals(True)
+        self.act_frame_slider.setMinimum(0)
+        self.act_frame_slider.setMaximum(0)
+        self.act_frame_slider.setValue(0)
+        self.act_frame_slider.blockSignals(False)
+        self.act_frame_label.setText("0 / 0")
+        self.act_thumb_strip.clear()
+        self._act_thumb_pending = []
+        self._act_thumb_icon_cache.clear()
+        self._act_thumb_timer.stop()
+        self.preview_canvas.set_pixmap(None)
     
     def _toggle_act_preview(self):
-        """Toggle ACT preview animation."""
-        if not self._act_preview_act or not self._act_preview_sprite:
+        """
+        Fix: Play button not responsive.
+        Root cause in the ActEditor-like patch: selecting/scrubbing sets _act_selected_spr_idx,
+        and _render_act_preview_frame() then always renders SPR-only, so animation appears stuck.
+
+        Behavior:
+          - Press Play: clears SPR-only selection and starts ACT animation timer
+          - Press Pause: stops timer (keeps current view)
+        """
+        if not (self._act_preview_act and self._act_preview_sprite):
             return
-        
-        self._act_preview_playing = not self._act_preview_playing
-        if self._act_preview_playing:
+
+        playing = bool(getattr(self, "_act_preview_playing", False))
+        if not playing:
+            # Start playing: ensure we are not in "SPR frame only" locked state
+            self._act_selected_spr_idx = None
+            self.act_show_spr_only.blockSignals(True)
+            self.act_show_spr_only.setChecked(False)
+            self.act_show_spr_only.blockSignals(False)
+
+            self._act_preview_playing = True
             self.act_play_btn.setText("⏸ Pause")
+            # Timer tick (existing _advance_act_preview_frame should advance + render)
             self._schedule_act_preview_frame()
+            # Render immediately so user sees responsiveness
+            self._render_act_preview_frame()
         else:
+            # Pause
+            self._act_preview_playing = False
             self.act_play_btn.setText("▶ Play")
             self._act_preview_timer.stop()
     
@@ -1529,131 +2085,37 @@ class GRFBrowserWidget(QWidget):
         self._act_preview_timer.start(delay)
     
     def _render_act_preview_frame(self):
-        """Render current ACT preview frame (auto-fit bounds + checkerboard background)."""
+        """Render current ACT preview frame to the CanvasPreviewWidget (ActEditor-like)."""
         if not (self._act_preview_act and self._act_preview_sprite):
             return
-        
+
         if not PIL_AVAILABLE:
-            self.preview_label.setText("PIL not available — preview disabled")
+            self.file_info.setText(self.file_info.text() + "\n\nPIL not available — preview disabled")
+            self.preview_canvas.set_pixmap(None)
             return
-        
+
+        if self._act_selected_spr_idx is not None:
+            self._render_selected_spr_frame_only(int(self._act_selected_spr_idx))
+            return
+
         action = self._act_preview_act.get_action(self._act_preview_action_idx)
         if not action or action.get_frame_count() == 0:
-            self.preview_label.setText("No frames to render")
-            return
-        
-        frame = action.get_frame(self._act_preview_frame_idx)
-        if not frame:
-            self.preview_label.setText("Invalid frame")
-            return
-        
-        # Build tight bounds so we don't render off-canvas (this is why your preview was blank).
-        indexed_count = self._act_preview_sprite.get_indexed_count()
-        total_frames = self._act_preview_sprite.get_total_frames()
-
-        rendered = []
-        min_x = 10**9
-        min_y = 10**9
-        max_x = -10**9
-        max_y = -10**9
-
-        for layer in getattr(frame, "layers", []) or []:
-            sprite_idx = getattr(layer, "sprite_index", -1)
-            if sprite_idx is None or sprite_idx < 0:
-                continue
-
-            if getattr(layer, "sprite_type", 0) == 1:
-                sprite_idx += indexed_count
-
-            if sprite_idx < 0 or sprite_idx >= total_frames:
-                continue
-
-            # Get sprite image (cache)
-            img = self._act_frame_cache.get(sprite_idx)
-            if img is None:
-                try:
-                    img = self._act_preview_sprite.get_frame_image(sprite_idx)
-                except Exception:
-                    img = None
-                if img is not None:
-                    self._act_frame_cache[sprite_idx] = img
-
-            if img is None:
-                continue
-
-            img = self._apply_layer_transforms(img, layer)
-
-            # Treat layer (x,y) as centered position
-            left = int(getattr(layer, "x", 0) - (img.width // 2))
-            top = int(getattr(layer, "y", 0) - (img.height // 2))
-            right = left + img.width
-            bottom = top + img.height
-
-            min_x = min(min_x, left)
-            min_y = min(min_y, top)
-            max_x = max(max_x, right)
-            max_y = max(max_y, bottom)
-
-            rendered.append((img, left, top, sprite_idx, getattr(layer, "sprite_type", 0)))
-
-        if not rendered:
-            # Helpful debug when ACT references indices not in SPR or all layers are off
-            if self._debug_mode:
-                print(f"[DEBUG] ACT render: no drawable layers for action={self._act_preview_action_idx} frame={self._act_preview_frame_idx}")
-            self.preview_label.setText("No drawable layers (sprite indices out of range or empty frame)")
+            self.preview_canvas.set_pixmap(None)
             return
 
-        pad = 10
-        canvas_w = max(1, int(max_x - min_x) + pad * 2)
-        canvas_h = max(1, int(max_y - min_y) + pad * 2)
+        if self._act_preview_frame_idx < 0 or self._act_preview_frame_idx >= action.get_frame_count():
+            self.preview_canvas.set_pixmap(None)
+            return
 
-        # Checkerboard background (ActEditor-like)
-        canvas = Image.new("RGBA", (canvas_w, canvas_h), (60, 60, 60, 255))
-        if ImageDraw:
-            draw_bg = ImageDraw.Draw(canvas)
-            tile = 16
-            c1 = (55, 55, 55, 255)
-            c2 = (75, 75, 75, 255)
-            for y in range(0, canvas_h, tile):
-                for x in range(0, canvas_w, tile):
-                    if ((x // tile) + (y // tile)) % 2 == 0:
-                        draw_bg.rectangle([x, y, x + tile - 1, y + tile - 1], fill=c1)
-                    else:
-                        draw_bg.rectangle([x, y, x + tile - 1, y + tile - 1], fill=c2)
-
-        origin_x = -min_x + pad
-        origin_y = -min_y + pad
-
-        for img, left, top, sprite_idx, spr_type in rendered:
-            x = int(origin_x + left)
-            y = int(origin_y + top)
-            canvas.alpha_composite(img, (x, y))
-
-            if self._act_debug_overlay_enabled and ImageDraw:
-                draw = ImageDraw.Draw(canvas)
-                label = f"{sprite_idx} ({'RGBA' if spr_type == 1 else 'IDX'})"
-                draw.rectangle([x, y, x + img.width, y + img.height], outline=(255, 255, 0, 200))
-                draw.text((x + 2, y + 2), label, fill=(255, 255, 0, 220))
-        
-        # Convert to QPixmap and display
-        try:
-            # Avoid PIL.ImageQt (version mismatch issues). Use raw RGBA -> QImage.
-            if canvas.mode != "RGBA":
-                canvas = canvas.convert("RGBA")
-            w, h = canvas.size
-            buf = canvas.tobytes("raw", "RGBA")
-            qimg = QImage(buf, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
-            pixmap = QPixmap.fromImage(qimg)
-            
-            # Scale if too large
-            max_size = 800
-            if pixmap.width() > max_size or pixmap.height() > max_size:
-                pixmap = pixmap.scaled(max_size, max_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            
-            self.preview_label.setPixmap(pixmap)
-            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        except Exception as e:
-            self.preview_label.setText(f"Render error: {e}")
+        fixed_origin = bool(self.fixed_origin_check.isChecked())
+        pil_canvas = self._render_act_frame_pil(self._act_preview_action_idx, self._act_preview_frame_idx, fixed_origin=fixed_origin)
+        if pil_canvas is None:
+            self.preview_canvas.set_pixmap(None)
+            return
+        pm = self._pil_to_qpixmap(pil_canvas)
+        self.preview_canvas.set_pixmap(pm)
+        # Default to 1:1 (user requested). Do not auto-fit during preview/animation.
+        # Users can press Fit manually anytime.
     
     def _apply_layer_transforms(self, img: Image.Image, layer) -> Image.Image:
         """Apply layer transforms (width/height override, mirror, scale, rotation, color tint) to image."""
