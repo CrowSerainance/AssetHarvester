@@ -254,36 +254,73 @@ class AddServerDialog(QDialog):
 
 
 # ==============================================================================
-# WORKER THREAD FOR BACKGROUND OPERATIONS
+# WORKER THREAD FOR BACKGROUND OPERATIONS (ENHANCED VERSION)
+# ==============================================================================
+# This enhanced worker supports chained operations for "Quick Extract Custom"
+# which performs: Scan Baseline → Compare → Export Custom in one operation.
 # ==============================================================================
 class ExtractWorker(QThread):
     """
     Background worker for extraction and comparison operations.
     
+    Supports both individual operations and the chained "quick_extract_custom"
+    operation which performs: scan_baseline → compare → export_custom
+    
     Signals:
-        progress(int, int, str): current, total, message
-        log(str): log message
-        finished(dict): results dictionary
-        error(str): error message
+        progress(int, int, str): current, total, message - Progress update
+        log(str): log message - Log output for the log panel
+        finished(dict): results dictionary - Operation complete
+        error(str): error message - Operation failed
+        phase_complete(str, dict): phase_name, results - For chained operations
     """
-    progress = pyqtSignal(int, int, str)
-    log = pyqtSignal(str)
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
+    progress = pyqtSignal(int, int, str)      # (current, total, message)
+    log = pyqtSignal(str)                      # Log message
+    finished = pyqtSignal(dict)                # Final results
+    error = pyqtSignal(str)                    # Error message
+    phase_complete = pyqtSignal(str, dict)     # (phase_name, phase_results)
     
     def __init__(self, operation: str, **kwargs):
+        """
+        Initialize the worker thread.
+        
+        Args:
+            operation: The operation to perform. One of:
+                       - "scan_baseline": Scan vanilla client for baseline hashes
+                       - "extract": Extract all files from archives
+                       - "compare": Compare server against baseline
+                       - "export_custom": Export only custom/modified files
+                       - "quick_extract_custom": CHAIN of scan → compare → export
+            **kwargs: Operation-specific parameters
+        """
         super().__init__()
         self.operation = operation
         self.kwargs = kwargs
         self._cancelled = False
+        
+        # For chained operations, store intermediate results
+        self._baseline_hashes = {}
+        self._comparison_results = {}
+        self._custom_files = []
     
     def cancel(self):
-        """Request cancellation."""
+        """
+        Request cancellation of the current operation.
+        
+        Sets a flag that operation methods check periodically.
+        The operation will stop at the next safe checkpoint.
+        """
         self._cancelled = True
+        self.log.emit("⚠️ Cancellation requested...")
     
     def run(self):
-        """Execute the operation."""
+        """
+        Execute the operation in the background thread.
+        
+        This is called automatically when start() is invoked.
+        Routes to the appropriate operation handler based on self.operation.
+        """
         try:
+            # Route to the appropriate operation handler
             if self.operation == "scan_baseline":
                 self._scan_baseline()
             elif self.operation == "extract":
@@ -292,17 +329,201 @@ class ExtractWorker(QThread):
                 self._compare()
             elif self.operation == "export_custom":
                 self._export_custom()
+            elif self.operation == "quick_extract_custom":
+                # NEW: Chained operation - Scan → Compare → Export
+                self._quick_extract_custom()
+            else:
+                self.error.emit(f"Unknown operation: {self.operation}")
+                
         except Exception as e:
-            self.error.emit(str(e))
+            # Catch any unhandled exceptions and report them
+            import traceback
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            self.error.emit(error_msg)
     
-    def _scan_baseline(self):
-        """Scan a vanilla client to build baseline hashes."""
-        path = self.kwargs.get('path')
+    # ==========================================================================
+    # NEW: QUICK EXTRACT CUSTOM - CHAINED OPERATION
+    # ==========================================================================
+    
+    def _quick_extract_custom(self):
+        """
+        Perform the complete custom extraction workflow in one operation.
+        
+        This chains three operations together:
+        1. Scan baseline (if not already provided)
+        2. Compare server client against baseline
+        3. Export only custom/modified files
+        
+        This is the "one button" solution that automates the entire workflow.
+        """
+        # Extract parameters
+        vanilla_path = self.kwargs.get('vanilla_path')
+        server_path = self.kwargs.get('server_path')
+        output_path = self.kwargs.get('output_path')
         game_format = self.kwargs.get('format', 'grf')
+        existing_baseline = self.kwargs.get('existing_baseline', {})
+        skip_baseline = self.kwargs.get('skip_baseline', False)
         
-        self.log.emit(f"Scanning baseline: {path}")
-        self.log.emit(f"Format: {game_format}")
+        # Validate required paths
+        if not server_path:
+            self.error.emit("Server client path is required!")
+            return
+        if not output_path:
+            self.error.emit("Output path is required!")
+            return
         
+        self.log.emit("=" * 60)
+        self.log.emit("🚀 QUICK EXTRACT CUSTOM - Starting automated workflow")
+        self.log.emit("=" * 60)
+        self.log.emit(f"Server Client: {server_path}")
+        self.log.emit(f"Output: {output_path}")
+        self.log.emit(f"Format: {game_format.upper()}")
+        self.log.emit("")
+        
+        # ===== PHASE 1: SCAN BASELINE =====
+        if skip_baseline and existing_baseline:
+            # Use existing baseline instead of scanning
+            self.log.emit("📋 Phase 1/3: Using existing baseline...")
+            self._baseline_hashes = existing_baseline
+            self.log.emit(f"  ✅ Existing baseline has {len(self._baseline_hashes)} files")
+        elif vanilla_path:
+            # Scan vanilla client for baseline
+            self.log.emit("📋 Phase 1/3: Scanning vanilla baseline...")
+            self.log.emit(f"  Vanilla Path: {vanilla_path}")
+            
+            # Perform baseline scan
+            if not self._scan_baseline_internal(vanilla_path, game_format):
+                return  # Error already emitted
+            
+            self.log.emit(f"  ✅ Baseline complete: {len(self._baseline_hashes)} files")
+            
+            # Emit phase completion so main window can save baseline
+            self.phase_complete.emit("baseline", {
+                'hashes': self._baseline_hashes,
+                'total': len(self._baseline_hashes)
+            })
+        else:
+            # No baseline - all files will be marked as "new"
+            self.log.emit("📋 Phase 1/3: No vanilla path provided")
+            self.log.emit("  ⚠️ All server files will be marked as NEW (custom)")
+            self._baseline_hashes = {}
+        
+        if self._cancelled:
+            self._emit_cancelled_result()
+            return
+        
+        # ===== PHASE 2: COMPARE =====
+        self.log.emit("")
+        self.log.emit("🔍 Phase 2/3: Comparing server client to baseline...")
+        
+        if not self._compare_internal(server_path, game_format):
+            return  # Error already emitted
+        
+        # Calculate custom file count
+        modified_count = len(self._comparison_results.get('modified', []))
+        new_count = len(self._comparison_results.get('new', []))
+        custom_count = modified_count + new_count
+        
+        self.log.emit(f"  Modified files: {modified_count}")
+        self.log.emit(f"  New files: {new_count}")
+        self.log.emit(f"  ✅ Total custom content: {custom_count} files")
+        
+        # Emit phase completion so main window can update results tab
+        self.phase_complete.emit("compare", {
+            'results': self._comparison_results,
+            'custom_count': custom_count
+        })
+        
+        if self._cancelled:
+            self._emit_cancelled_result()
+            return
+        
+        # Check if there's anything to export
+        if custom_count == 0:
+            self.log.emit("")
+            self.log.emit("=" * 60)
+            self.log.emit("✅ COMPLETE - No custom content found!")
+            self.log.emit("  The server client appears to be vanilla.")
+            self.log.emit("=" * 60)
+            
+            self.finished.emit({
+                'type': 'quick_extract_custom',
+                'baseline_count': len(self._baseline_hashes),
+                'custom_count': 0,
+                'exported': 0,
+                'cancelled': False,
+                'results': self._comparison_results
+            })
+            return
+        
+        # ===== PHASE 3: EXPORT CUSTOM =====
+        self.log.emit("")
+        self.log.emit("📦 Phase 3/3: Exporting custom content...")
+        
+        # Combine modified and new files
+        self._custom_files = (
+            self._comparison_results.get('modified', []) +
+            self._comparison_results.get('new', [])
+        )
+        
+        # Create output subfolder for custom content
+        custom_output = os.path.join(output_path, "CUSTOM_CONTENT")
+        self.log.emit(f"  Output: {custom_output}")
+        
+        if not self._export_custom_internal(server_path, custom_output, game_format):
+            return  # Error already emitted
+        
+        if self._cancelled:
+            self._emit_cancelled_result()
+            return
+        
+        # ===== COMPLETE =====
+        self.log.emit("")
+        self.log.emit("=" * 60)
+        self.log.emit("🎉 QUICK EXTRACT CUSTOM - COMPLETE!")
+        self.log.emit("=" * 60)
+        self.log.emit(f"  Baseline files: {len(self._baseline_hashes)}")
+        self.log.emit(f"  Custom files found: {custom_count}")
+        self.log.emit(f"  Files exported: {self._export_count}")
+        self.log.emit(f"  Output location: {custom_output}")
+        self.log.emit("")
+        
+        self.finished.emit({
+            'type': 'quick_extract_custom',
+            'baseline_count': len(self._baseline_hashes),
+            'custom_count': custom_count,
+            'exported': self._export_count,
+            'output_path': custom_output,
+            'cancelled': False,
+            'results': self._comparison_results,
+            'baseline': self._baseline_hashes
+        })
+    
+    def _emit_cancelled_result(self):
+        """Emit a cancelled result for quick_extract_custom."""
+        self.log.emit("\n⚠️ Operation cancelled by user")
+        self.finished.emit({
+            'type': 'quick_extract_custom',
+            'cancelled': True,
+            'baseline': self._baseline_hashes,
+            'results': self._comparison_results
+        })
+    
+    # ==========================================================================
+    # INTERNAL OPERATION METHODS (used by both individual and chained ops)
+    # ==========================================================================
+    
+    def _scan_baseline_internal(self, path: str, game_format: str) -> bool:
+        """
+        Internal baseline scanning logic.
+        
+        Args:
+            path: Path to vanilla client folder
+            game_format: Archive format (grf, vfs, pak, etc.)
+            
+        Returns:
+            True if successful, False if error
+        """
         # Find archive files
         archives = []
         extensions = self._get_extensions(game_format)
@@ -312,76 +533,286 @@ class ExtractWorker(QThread):
                 if any(f.lower().endswith(ext) for ext in extensions):
                     archives.append(os.path.join(root, f))
         
-        self.log.emit(f"Found {len(archives)} archive(s)")
-        
         if not archives:
             self.error.emit(f"No {game_format.upper()} archives found in {path}")
-            return
+            return False
+        
+        self.log.emit(f"  Found {len(archives)} archive(s)")
         
         # Process each archive
-        baseline_hashes = {}
+        self._baseline_hashes = {}
         total_files = 0
         
         for i, archive_path in enumerate(archives):
             if self._cancelled:
-                self.log.emit("Cancelled by user")
-                return
+                return False
             
-            self.progress.emit(i, len(archives), f"Processing: {os.path.basename(archive_path)}")
-            self.log.emit(f"\nProcessing: {archive_path}")
+            archive_name = os.path.basename(archive_path)
+            self.progress.emit(i, len(archives), f"Scanning: {archive_name}")
+            self.log.emit(f"  Scanning: {archive_name}")
             
-            # Get extractor for this format
             extractor = self._get_extractor(game_format, archive_path)
             if not extractor:
-                self.log.emit(f"  [SKIP] No extractor for format: {game_format}")
                 continue
             
-            # List files in archive
             try:
                 if extractor.open(archive_path):
                     files = extractor.list_files()
-                    self.log.emit(f"  Found {len(files)} files")
                     
                     for j, entry in enumerate(files):
                         if self._cancelled:
-                            self.log.emit("Cancelled by user")
-                            return
+                            extractor.close()
+                            return False
                         
-                        if j % 100 == 0:  # Check more frequently (every 100 files instead of 1000)
-                            if self._cancelled:
-                                self.log.emit("Cancelled by user")
-                                return
-                            self.progress.emit(j, len(files), f"Hashing: {entry.path[:50]}...")
+                        if j % 100 == 0:
+                            self.progress.emit(j, len(files), f"Hashing: {entry.path[:40]}...")
                         
-                        # Get file data and hash it
                         data = extractor.get_file_data(entry.path)
                         if data:
                             file_hash = hashlib.md5(data).hexdigest()
-                            baseline_hashes[entry.path.lower()] = {
+                            self._baseline_hashes[entry.path.lower()] = {
                                 'hash': file_hash,
                                 'size': len(data),
-                                'archive': os.path.basename(archive_path)
+                                'archive': archive_name
                             }
                             total_files += 1
                     
                     extractor.close()
             except Exception as e:
-                self.log.emit(f"  [ERROR] {e}")
+                self.log.emit(f"    [ERROR] {e}")
+        
+        return True
+    
+    def _compare_internal(self, source: str, game_format: str) -> bool:
+        """
+        Internal comparison logic.
+        
+        Args:
+            source: Path to server client folder
+            game_format: Archive format
+            
+        Returns:
+            True if successful, False if error
+        """
+        # Find archives
+        archives = []
+        extensions = self._get_extensions(game_format)
+        
+        for root, dirs, files in os.walk(source):
+            for f in files:
+                if any(f.lower().endswith(ext) for ext in extensions):
+                    archives.append(os.path.join(root, f))
+        
+        if not archives:
+            self.error.emit(f"No archives found in {source}")
+            return False
+        
+        self._comparison_results = {
+            'identical': [],
+            'modified': [],
+            'new': [],
+            'missing': []
+        }
+        
+        server_files = {}
+        
+        for archive_path in archives:
+            if self._cancelled:
+                return False
+            
+            archive_name = os.path.basename(archive_path)
+            self.log.emit(f"  Scanning: {archive_name}")
+            
+            extractor = self._get_extractor(game_format, archive_path)
+            if not extractor:
+                continue
+            
+            try:
+                if extractor.open(archive_path):
+                    files = extractor.list_files()
+                    
+                    for j, entry in enumerate(files):
+                        if self._cancelled:
+                            extractor.close()
+                            return False
+                        
+                        if j % 500 == 0:
+                            self.progress.emit(j, len(files), f"Comparing: {entry.path[:40]}...")
+                        
+                        path_lower = entry.path.lower()
+                        data = extractor.get_file_data(entry.path)
+                        
+                        if data:
+                            file_hash = hashlib.md5(data).hexdigest()
+                            server_files[path_lower] = {
+                                'hash': file_hash,
+                                'size': len(data),
+                                'path': entry.path
+                            }
+                            
+                            # Compare with baseline
+                            if path_lower in self._baseline_hashes:
+                                if self._baseline_hashes[path_lower]['hash'] == file_hash:
+                                    self._comparison_results['identical'].append(entry.path)
+                                else:
+                                    self._comparison_results['modified'].append(entry.path)
+                            else:
+                                self._comparison_results['new'].append(entry.path)
+                    
+                    extractor.close()
+            except Exception as e:
+                self.log.emit(f"    [ERROR] {e}")
+        
+        # Find missing files
+        for path in self._baseline_hashes:
+            if path not in server_files:
+                self._comparison_results['missing'].append(path)
+        
+        return True
+    
+    def _export_custom_internal(self, source: str, output: str, game_format: str) -> bool:
+        """
+        Internal export logic.
+        
+        Args:
+            source: Path to server client folder
+            output: Output path for exported files
+            game_format: Archive format
+            
+        Returns:
+            True if successful, False if error
+        """
+        os.makedirs(output, exist_ok=True)
+        
+        # Find archives
+        archives = []
+        extensions = self._get_extensions(game_format)
+        
+        for root, dirs, files in os.walk(source):
+            for f in files:
+                if any(f.lower().endswith(ext) for ext in extensions):
+                    archives.append(os.path.join(root, f))
+        
+        # Convert to set for fast lookup
+        custom_set = set(f.lower() for f in self._custom_files)
+        
+        self._export_count = 0
+        self._export_errors = 0
+        
+        for archive_path in archives:
+            if self._cancelled:
+                return False
+            
+            extractor = self._get_extractor(game_format, archive_path)
+            if not extractor:
+                continue
+            
+            try:
+                if extractor.open(archive_path):
+                    files = extractor.list_files()
+                    
+                    for j, entry in enumerate(files):
+                        if self._cancelled:
+                            extractor.close()
+                            return False
+                        
+                        if entry.path.lower() in custom_set:
+                            # Build output path, sanitizing for Windows
+                            safe_path = self._sanitize_path(entry.path)
+                            out_path = os.path.join(output, safe_path)
+                            
+                            if j % 50 == 0:
+                                self.progress.emit(
+                                    self._export_count, 
+                                    len(self._custom_files), 
+                                    f"Exporting: {entry.path[:50]}..."
+                                )
+                            
+                            try:
+                                if extractor.extract_file(entry.path, out_path):
+                                    self._export_count += 1
+                                else:
+                                    self._export_errors += 1
+                            except Exception as e:
+                                # Log error but continue
+                                self.log.emit(f"    [ERROR] Failed to export {entry.path}: {e}")
+                                self._export_errors += 1
+                    
+                    extractor.close()
+            except Exception as e:
+                self.log.emit(f"    [ERROR] {e}")
+        
+        if self._export_errors > 0:
+            self.log.emit(f"  ⚠️ {self._export_errors} files failed to export")
+        
+        return True
+    
+    def _sanitize_path(self, path: str) -> str:
+        """
+        Sanitize a file path for Windows filesystem.
+        
+        Removes or replaces invalid characters that can cause
+        WinError 123 (invalid filename syntax).
+        
+        Args:
+            path: Original path from archive
+            
+        Returns:
+            Sanitized path safe for Windows
+        """
+        # Replace backslashes with OS separator
+        path = path.replace('\\', os.sep)
+        
+        # Characters invalid in Windows filenames
+        invalid_chars = '<>:"|?*'
+        
+        # Replace invalid characters with underscore
+        for char in invalid_chars:
+            path = path.replace(char, '_')
+        
+        # Remove control characters and non-printable chars
+        path = ''.join(c if c.isprintable() and ord(c) < 128 else '_' for c in path)
+        
+        # Remove leading/trailing spaces and dots from path components
+        parts = path.split(os.sep)
+        sanitized_parts = []
+        for part in parts:
+            part = part.strip('. ')
+            if part:
+                sanitized_parts.append(part)
+        
+        return os.sep.join(sanitized_parts)
+    
+    # ==========================================================================
+    # ORIGINAL STANDALONE OPERATIONS (unchanged but use internal methods)
+    # ==========================================================================
+    
+    def _scan_baseline(self):
+        """Scan a vanilla client to build baseline hashes."""
+        path = self.kwargs.get('path')
+        game_format = self.kwargs.get('format', 'grf')
+        
+        self.log.emit(f"Scanning baseline: {path}")
+        self.log.emit(f"Format: {game_format}")
+        
+        if not self._scan_baseline_internal(path, game_format):
+            if not self._cancelled:
+                return
         
         if self._cancelled:
             self.log.emit("\n⚠️ Baseline scan cancelled")
             self.finished.emit({
                 'type': 'baseline',
-                'hashes': baseline_hashes,
-                'total': total_files,
+                'hashes': self._baseline_hashes,
+                'total': len(self._baseline_hashes),
                 'cancelled': True
             })
         else:
-            self.log.emit(f"\nBaseline complete: {total_files} files hashed")
+            self.log.emit(f"\n✅ Baseline complete: {len(self._baseline_hashes)} files hashed")
             self.finished.emit({
                 'type': 'baseline',
-                'hashes': baseline_hashes,
-                'total': total_files,
+                'hashes': self._baseline_hashes,
+                'total': len(self._baseline_hashes),
                 'cancelled': False
             })
     
@@ -415,7 +846,7 @@ class ExtractWorker(QThread):
         for i, archive_path in enumerate(archives):
             if self._cancelled:
                 self.log.emit("Cancelled")
-                return
+                break
             
             self.log.emit(f"\nExtracting: {os.path.basename(archive_path)}")
             
@@ -430,18 +861,23 @@ class ExtractWorker(QThread):
                     
                     for j, entry in enumerate(files):
                         if self._cancelled:
-                            return
+                            extractor.close()
+                            break
                         
                         if j % 100 == 0:
                             self.progress.emit(j, len(files), entry.path[:60])
                         
-                        # Build output path
-                        out_path = os.path.join(output, entry.path.replace('\\', os.sep))
+                        # Sanitize path for Windows
+                        safe_path = self._sanitize_path(entry.path)
+                        out_path = os.path.join(output, safe_path)
                         
-                        # Extract
-                        if extractor.extract_file(entry.path, out_path):
-                            total_extracted += 1
-                        else:
+                        try:
+                            if extractor.extract_file(entry.path, out_path):
+                                total_extracted += 1
+                            else:
+                                total_errors += 1
+                        except Exception as e:
+                            self.log.emit(f"    [ERROR] {entry.path}: {e}")
                             total_errors += 1
                     
                     extractor.close()
@@ -451,22 +887,17 @@ class ExtractWorker(QThread):
         
         if self._cancelled:
             self.log.emit(f"\n⚠️ Extraction cancelled")
-            self.finished.emit({
-                'type': 'extract',
-                'extracted': total_extracted,
-                'errors': total_errors,
-                'cancelled': True
-            })
         else:
-            self.log.emit(f"\nExtraction complete!")
+            self.log.emit(f"\n✅ Extraction complete!")
             self.log.emit(f"  Extracted: {total_extracted}")
             self.log.emit(f"  Errors: {total_errors}")
-            self.finished.emit({
-                'type': 'extract',
-                'extracted': total_extracted,
-                'errors': total_errors,
-                'cancelled': False
-            })
+        
+        self.finished.emit({
+            'type': 'extract',
+            'extracted': total_extracted,
+            'errors': total_errors,
+            'cancelled': self._cancelled
+        })
     
     def _compare(self):
         """Compare client against baseline to find custom content."""
@@ -481,100 +912,32 @@ class ExtractWorker(QThread):
             self.error.emit("No baseline loaded! Scan vanilla first.")
             return
         
-        # Find archives
-        archives = []
-        extensions = self._get_extensions(game_format)
+        # Use baseline from kwargs
+        self._baseline_hashes = baseline
         
-        for root, dirs, files in os.walk(source):
-            for f in files:
-                if any(f.lower().endswith(ext) for ext in extensions):
-                    archives.append(os.path.join(root, f))
-        
-        results = {
-            'identical': [],      # Same hash as vanilla
-            'modified': [],       # Different hash from vanilla
-            'new': [],            # Not in vanilla at all
-            'missing': []         # In vanilla but not in server
-        }
-        
-        server_files = {}
-        
-        for archive_path in archives:
-            if self._cancelled:
+        if not self._compare_internal(source, game_format):
+            if not self._cancelled:
                 return
-            
-            self.log.emit(f"\nScanning: {os.path.basename(archive_path)}")
-            
-            extractor = self._get_extractor(game_format, archive_path)
-            if not extractor:
-                continue
-            
-            try:
-                if extractor.open(archive_path):
-                    files = extractor.list_files()
-                    
-                    for j, entry in enumerate(files):
-                        if self._cancelled:
-                            return
-                        
-                        if j % 500 == 0:
-                            self.progress.emit(j, len(files), f"Comparing: {entry.path[:50]}...")
-                        
-                        path_lower = entry.path.lower()
-                        data = extractor.get_file_data(entry.path)
-                        
-                        if data:
-                            file_hash = hashlib.md5(data).hexdigest()
-                            server_files[path_lower] = {
-                                'hash': file_hash,
-                                'size': len(data),
-                                'path': entry.path
-                            }
-                            
-                            # Compare with baseline
-                            if path_lower in baseline:
-                                if baseline[path_lower]['hash'] == file_hash:
-                                    results['identical'].append(entry.path)
-                                else:
-                                    results['modified'].append(entry.path)
-                            else:
-                                results['new'].append(entry.path)
-                    
-                    extractor.close()
-            except Exception as e:
-                self.log.emit(f"  [ERROR] {e}")
-        
-        # Find missing files
-        for path in baseline:
-            if path not in server_files:
-                results['missing'].append(path)
         
         if self._cancelled:
             self.log.emit(f"\n⚠️ Comparison cancelled")
-            self.finished.emit({
-                'type': 'compare',
-                'results': results,
-                'server_files': server_files,
-                'cancelled': True
-            })
         else:
             self.log.emit(f"\n{'='*50}")
             self.log.emit(f"COMPARISON RESULTS:")
-            self.log.emit(f"  Identical: {len(results['identical'])}")
-            self.log.emit(f"  Modified:  {len(results['modified'])}")
-            self.log.emit(f"  New:       {len(results['new'])}")
-            self.log.emit(f"  Missing:   {len(results['missing'])}")
+            self.log.emit(f"  Identical: {len(self._comparison_results['identical'])}")
+            self.log.emit(f"  Modified:  {len(self._comparison_results['modified'])}")
+            self.log.emit(f"  New:       {len(self._comparison_results['new'])}")
+            self.log.emit(f"  Missing:   {len(self._comparison_results['missing'])}")
             self.log.emit(f"{'='*50}")
             
-            custom_count = len(results['modified']) + len(results['new'])
+            custom_count = len(self._comparison_results['modified']) + len(self._comparison_results['new'])
             self.log.emit(f"\n>>> CUSTOM CONTENT: {custom_count} files <<<")
-            
-            self.finished.emit({
-                'type': 'compare',
-                'results': results,
-                'server_files': server_files,
-                'cancelled': False
-            })
+        
+        self.finished.emit({
+            'type': 'compare',
+            'results': self._comparison_results,
+            'cancelled': self._cancelled
+        })
     
     def _export_custom(self):
         """Export only custom/modified files."""
@@ -589,66 +952,22 @@ class ExtractWorker(QThread):
             self.error.emit("No custom files to export! Run comparison first.")
             return
         
-        # Create output dir
-        os.makedirs(output, exist_ok=True)
+        self._custom_files = custom_files
         
-        # Find archives
-        archives = []
-        extensions = self._get_extensions(game_format)
-        
-        for root, dirs, files in os.walk(source):
-            for f in files:
-                if any(f.lower().endswith(ext) for ext in extensions):
-                    archives.append(os.path.join(root, f))
-        
-        # Convert to set for fast lookup
-        custom_set = set(f.lower() for f in custom_files)
-        
-        exported = 0
-        
-        for archive_path in archives:
-            if self._cancelled:
+        if not self._export_custom_internal(source, output, game_format):
+            if not self._cancelled:
                 return
-            
-            extractor = self._get_extractor(game_format, archive_path)
-            if not extractor:
-                continue
-            
-            try:
-                if extractor.open(archive_path):
-                    files = extractor.list_files()
-                    
-                    for j, entry in enumerate(files):
-                        if self._cancelled:
-                            return
-                        
-                        if entry.path.lower() in custom_set:
-                            out_path = os.path.join(output, entry.path.replace('\\', os.sep))
-                            
-                            if j % 50 == 0:
-                                self.progress.emit(exported, len(custom_files), entry.path[:60])
-                            
-                            if extractor.extract_file(entry.path, out_path):
-                                exported += 1
-                    
-                    extractor.close()
-            except Exception as e:
-                self.log.emit(f"[ERROR] {e}")
         
         if self._cancelled:
             self.log.emit(f"\n⚠️ Export cancelled")
-            self.finished.emit({
-                'type': 'export_custom',
-                'exported': exported,
-                'cancelled': True
-            })
         else:
-            self.log.emit(f"\nExported {exported} custom files to: {output}")
-            self.finished.emit({
-                'type': 'export_custom',
-                'exported': exported,
-                'cancelled': False
-            })
+            self.log.emit(f"\n✅ Exported {self._export_count} custom files to: {output}")
+        
+        self.finished.emit({
+            'type': 'export_custom',
+            'exported': self._export_count,
+            'cancelled': self._cancelled
+        })
     
     def _get_extensions(self, game_format: str) -> list:
         """Get file extensions for a format."""
@@ -798,9 +1117,16 @@ class MainWindow(QMainWindow):
         
         toolbar.addSeparator()
         
-        # Quick Extract
+        # ===== QUICK EXTRACT CUSTOM - THE ONE BUTTON SOLUTION =====
         quick_extract = QAction("⚡ Quick Extract Custom", self)
-        quick_extract.setToolTip("Extract only custom content (requires baseline)")
+        quick_extract.setToolTip(
+            "ONE-BUTTON EXTRACTION!\n\n"
+            "Automatically performs:\n"
+            "1. Scan vanilla baseline\n"
+            "2. Compare server client\n"
+            "3. Export only custom content\n\n"
+            "Set paths in Extract tab first."
+        )
         quick_extract.triggered.connect(self._on_quick_extract)
         toolbar.addAction(quick_extract)
         
@@ -928,8 +1254,51 @@ class MainWindow(QMainWindow):
         # === ACTION BUTTONS ===
         actions = QHBoxLayout()
         
+        # ===== QUICK EXTRACT - PRIMARY ACTION =====
+        self.quick_extract_btn = QPushButton("⚡ QUICK EXTRACT CUSTOM")
+        self.quick_extract_btn.setToolTip(
+            "ONE-CLICK EXTRACTION!\n\n"
+            "Automatically performs:\n"
+            "1. Scan vanilla baseline (if needed)\n"
+            "2. Compare to find custom content\n"
+            "3. Export only modified/new files\n\n"
+            "This is the fastest way to get custom content!"
+        )
+        self.quick_extract_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9c27b0;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 12px 24px;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #ab47bc;
+            }
+            QPushButton:pressed {
+                background-color: #7b1fa2;
+            }
+            QPushButton:disabled {
+                background-color: #4a4a6a;
+                color: #888888;
+            }
+        """)
+        self.quick_extract_btn.clicked.connect(self._on_quick_extract)
+        actions.addWidget(self.quick_extract_btn)
+        
+        actions.addSpacing(20)
+        
+        # Separator label
+        or_label = QLabel("— or use individual steps —")
+        or_label.setStyleSheet("color: #888888; font-style: italic;")
+        actions.addWidget(or_label)
+        
+        actions.addSpacing(20)
+        
+        # ===== INDIVIDUAL STEP BUTTONS =====
         self.extract_all_btn = QPushButton("📦 Extract ALL Files")
-        self.extract_all_btn.setToolTip("Extract everything from the server client")
+        self.extract_all_btn.setToolTip("Extract everything from the server client (slow)")
         self.extract_all_btn.clicked.connect(self._on_extract_all)
         actions.addWidget(self.extract_all_btn)
         
@@ -940,10 +1309,11 @@ class MainWindow(QMainWindow):
         
         self.export_custom_btn = QPushButton("⭐ Export CUSTOM Only")
         self.export_custom_btn.setObjectName("orangeBtn")
-        self.export_custom_btn.setToolTip("Extract only custom/modified files (fastest!)")
+        self.export_custom_btn.setToolTip("Extract only custom/modified files")
         self.export_custom_btn.clicked.connect(self._on_export_custom)
         actions.addWidget(self.export_custom_btn)
         
+        # ===== CANCEL BUTTON =====
         self.cancel_btn = QPushButton("❌ Cancel")
         self.cancel_btn.setVisible(False)
         self.cancel_btn.clicked.connect(self._on_cancel)
@@ -1881,15 +2251,117 @@ class MainWindow(QMainWindow):
                           format=game_format)
     
     def _on_quick_extract(self):
-        """Quick extract - scan baseline, compare, and export custom in one go."""
-        self.tabs.setCurrentIndex(0)  # Switch to Extract tab
-        QMessageBox.information(
-            self, "Quick Extract",
-            "Quick Extract will:\n\n"
-            "1. Scan your vanilla baseline (if not already done)\n"
-            "2. Compare the private server client\n"
-            "3. Export only custom/modified files\n\n"
-            "Use the Extract tab to run each step."
+        """
+        Quick Extract Custom - One button to do everything.
+        
+        This performs the complete workflow:
+        1. Scan vanilla baseline (if not already done)
+        2. Compare server client against baseline
+        3. Export only custom/modified files
+        
+        All in a single automated operation.
+        """
+        # Switch to Extract tab so user can see progress
+        self.tabs.setCurrentIndex(0)
+        
+        # Validate required paths
+        server_path = self.server_path.text().strip()
+        output_path = self.output_path.text().strip()
+        vanilla_path = self.vanilla_path.text().strip()
+        
+        # Check server path
+        if not server_path:
+            QMessageBox.warning(
+                self, 
+                "Missing Path", 
+                "Please select a Server Client folder first!\n\n"
+                "This is the folder containing the private server's game files."
+            )
+            return
+        
+        if not os.path.isdir(server_path):
+            QMessageBox.warning(self, "Invalid Path", f"Server client folder not found:\n{server_path}")
+            return
+        
+        # Check output path
+        if not output_path:
+            QMessageBox.warning(
+                self,
+                "Missing Path",
+                "Set output extraction first."
+            )
+            return
+        
+        # Get game format
+        idx = self.game_combo.currentIndex()
+        game_format = self.games[idx][2] if idx >= 0 else "grf"
+        
+        # Determine if we need to scan baseline or can use existing
+        skip_baseline = False
+        if self.baseline:
+            # We have an existing baseline - ask user what to do
+            reply = QMessageBox.question(
+                self,
+                "Existing Baseline Found",
+                f"A baseline with {len(self.baseline)} files is already loaded.\n\n"
+                "Do you want to:\n"
+                "• Yes - Use the existing baseline (faster)\n"
+                "• No - Rescan the vanilla client\n"
+                "• Cancel - Abort the operation",
+                QMessageBox.StandardButton.Yes | 
+                QMessageBox.StandardButton.No | 
+                QMessageBox.StandardButton.Cancel
+            )
+            
+            if reply == QMessageBox.StandardButton.Cancel:
+                return
+            elif reply == QMessageBox.StandardButton.Yes:
+                skip_baseline = True
+        elif not vanilla_path:
+            # No baseline and no vanilla path
+            reply = QMessageBox.question(
+                self,
+                "No Vanilla Baseline",
+                "No vanilla baseline is loaded and no vanilla path is set.\n\n"
+                "Without a baseline, ALL files will be marked as 'new' (custom).\n\n"
+                "Do you want to continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            skip_baseline = True
+        
+        # Confirm the operation
+        msg = "Quick Extract Custom will now:\n\n"
+        if skip_baseline and self.baseline:
+            msg += f"1. Use existing baseline ({len(self.baseline)} files)\n"
+        elif vanilla_path:
+            msg += f"1. Scan vanilla client: {os.path.basename(vanilla_path)}\n"
+        else:
+            msg += "1. Skip baseline (all files = custom)\n"
+        msg += f"2. Compare server: {os.path.basename(server_path)}\n"
+        msg += f"3. Export custom content to:\n   {output_path}\\CUSTOM_CONTENT\n\n"
+        msg += "This may take several minutes. Continue?"
+        
+        reply = QMessageBox.question(
+            self,
+            "Confirm Quick Extract",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        # Start the quick extract operation
+        self._start_worker(
+            "quick_extract_custom",
+            vanilla_path=vanilla_path,
+            server_path=server_path,
+            output_path=output_path,
+            format=game_format,
+            existing_baseline=self.baseline if skip_baseline else {},
+            skip_baseline=skip_baseline
         )
     
     def _on_cancel(self):
@@ -1917,6 +2389,9 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.error.connect(self._on_worker_error)
         
+        # Connect phase_complete signal for chained operations
+        self.worker.phase_complete.connect(self._on_phase_complete)
+        
         # UI state
         self._set_busy(True)
         self.worker.start()
@@ -1930,6 +2405,7 @@ class MainWindow(QMainWindow):
         self.extract_all_btn.setEnabled(not busy)
         self.compare_btn.setEnabled(not busy)
         self.export_custom_btn.setEnabled(not busy)
+        self.quick_extract_btn.setEnabled(not busy)
     
     def _on_progress(self, current: int, total: int, message: str):
         """Handle progress update."""
@@ -1949,6 +2425,77 @@ class MainWindow(QMainWindow):
         
         result_type = result.get('type')
         
+        # ===== QUICK EXTRACT CUSTOM RESULT =====
+        if result_type == 'quick_extract_custom':
+            # Update baseline if we got one
+            if result.get('baseline'):
+                self.baseline = result['baseline']
+                count = len(self.baseline)
+                self.baseline_status.setText(f"✅ Baseline: {count} files")
+                self.baseline_status.setStyleSheet("color: #4caf50;")
+                
+                # Update games table
+                row = self.game_combo.currentIndex()
+                if row >= 0:
+                    self.games_table.setItem(row, 3, QTableWidgetItem(f"✅ {count} files"))
+                
+                # Update Character Designer
+                if hasattr(self, 'character_designer') and self.character_designer:
+                    if self.character_designer.custom_detector:
+                        baseline_hashes = {path: data.get('hash', '') for path, data in self.baseline.items()}
+                        self.character_designer.custom_detector.set_baseline(baseline_hashes)
+            
+            # Update comparison results
+            if result.get('results'):
+                self.comparison = {'results': result['results']}
+                results = result['results']
+                
+                identical = len(results.get('identical', []))
+                modified = len(results.get('modified', []))
+                new = len(results.get('new', []))
+                custom = modified + new
+                
+                self.identical_label.setText(f"Identical: {identical}")
+                self.modified_label.setText(f"Modified: {modified}")
+                self.new_label.setText(f"New: {new}")
+                self.custom_total_label.setText(f"⭐ CUSTOM TOTAL: {custom}")
+                
+                # Populate lists
+                self.modified_list.clear()
+                self.new_list.clear()
+                
+                for f in results.get('modified', [])[:1000]:
+                    self.modified_list.addItem(f)
+                
+                for f in results.get('new', [])[:1000]:
+                    self.new_list.addItem(f)
+            
+            # Show completion message
+            exported = result.get('exported', 0)
+            custom_count = result.get('custom_count', 0)
+            output_path = result.get('output_path', '')
+            
+            if exported > 0:
+                QMessageBox.information(
+                    self,
+                    "Quick Extract Complete! 🎉",
+                    f"Successfully extracted custom content!\n\n"
+                    f"Custom files found: {custom_count}\n"
+                    f"Files exported: {exported}\n\n"
+                    f"Output location:\n{output_path}"
+                )
+                # Switch to Results tab to show what was found
+                self.tabs.setCurrentIndex(2)
+            elif custom_count == 0:
+                QMessageBox.information(
+                    self,
+                    "Quick Extract Complete",
+                    "No custom content found!\n\n"
+                    "The server client appears to match the vanilla baseline."
+                )
+            return
+        
+        # ===== BASELINE RESULT =====
         if result_type == 'baseline':
             self.baseline = result.get('hashes', {})
             count = result.get('total', 0)
@@ -1968,6 +2515,7 @@ class MainWindow(QMainWindow):
                 self.character_designer.custom_detector.set_baseline(baseline_hashes)
                 self._log("Character Designer: Baseline updated")
         
+        # ===== COMPARE RESULT =====
         elif result_type == 'compare':
             self.comparison = result
             results = result.get('results', {})
@@ -1998,15 +2546,43 @@ class MainWindow(QMainWindow):
             
             self._log(f"\n✅ Comparison complete! {custom} custom files found")
         
+        # ===== EXTRACT RESULT =====
         elif result_type == 'extract':
             extracted = result.get('extracted', 0)
             self._log(f"\n✅ Extraction complete! {extracted} files extracted")
             QMessageBox.information(self, "Complete", f"Extracted {extracted} files!")
         
+        # ===== EXPORT CUSTOM RESULT =====
         elif result_type == 'export_custom':
             exported = result.get('exported', 0)
             self._log(f"\n✅ Export complete! {exported} custom files exported")
             QMessageBox.information(self, "Complete", f"Exported {exported} custom files!")
+
+    def _on_phase_complete(self, phase: str, results: dict):
+        """
+        Handle phase completion during chained operations.
+        
+        This is called during quick_extract_custom to update the UI
+        as each phase completes.
+        
+        Args:
+            phase: Phase name ("baseline", "compare", "export")
+            results: Phase results dictionary
+        """
+        if phase == "baseline":
+            # Update baseline status during quick extract
+            hashes = results.get('hashes', {})
+            count = len(hashes)
+            self.baseline_status.setText(f"✅ Baseline: {count} files")
+            self.baseline_status.setStyleSheet("color: #4caf50;")
+            
+            # Store baseline for later
+            self.baseline = hashes
+            
+        elif phase == "compare":
+            # Update results tab during quick extract
+            custom_count = results.get('custom_count', 0)
+            self._log(f"Found {custom_count} custom files")
     
     def _on_worker_error(self, error: str):
         """Handle worker error."""
