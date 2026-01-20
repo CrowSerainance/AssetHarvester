@@ -815,6 +815,172 @@ class ACTParser:
         
         return layer, offset
     
+    def save(self, act_data: ACTData, filepath: str) -> bool:
+        """
+        Save ACT data to a file.
+        
+        Args:
+            act_data: Data to save
+            filepath: Output path
+            
+        Returns:
+            True if successful
+        """
+        try:
+            data = self.save_to_bytes(act_data)
+            if not data:
+                return False
+                
+            with open(filepath, 'wb') as f:
+                f.write(data)
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to save ACT to {filepath}: {e}")
+            return False
+
+    def save_to_bytes(self, act_data: ACTData) -> Optional[bytes]:
+        """
+        Serialize ACT data to bytes.
+        
+        Args:
+            act_data: Data to serialize
+            
+        Returns:
+            Bytes object or None on error
+        """
+        try:
+            out = bytearray()
+            
+            # 1. Header
+            out.extend(ACT_SIGNATURE)
+            
+            # Version (default to 2.5 if not specified, or use existing)
+            # We force 2.5 to ensure all features (scale, color, anchors) work
+            ver_major, ver_minor = act_data.version
+            if ver_major < 2 or (ver_major == 2 and ver_minor < 5):
+                # Upgrade to 2.5 to support new features
+                ver_major, ver_minor = 2, 5
+            
+            out.append(ver_minor)
+            out.append(ver_major)
+            
+            # Action count
+            action_count = len(act_data.actions)
+            out.extend(struct.pack('<H', action_count))
+            
+            # Reserved (10 bytes)
+            out.extend(b'\x00' * 10)
+            
+            # 2. Actions
+            for action in act_data.actions:
+                self._write_action(out, action, (ver_major, ver_minor))
+                
+            # 3. Events (Sound) - Version 2.1+
+            if (ver_major > 2) or (ver_major == 2 and ver_minor >= 1):
+                event_count = len(act_data.events)
+                out.extend(struct.pack('<I', event_count))
+                for event in act_data.events:
+                    # Write fixed length string (40 chars)
+                    name_bytes = event.name.encode('latin-1')[:39]
+                    out.extend(name_bytes)
+                    out.extend(b'\x00' * (40 - len(name_bytes)))
+            
+            # 4. Animation Speeds - Version 2.2+
+            if (ver_major > 2) or (ver_major == 2 and ver_minor >= 2):
+                # We need to reconstruct delays per action.
+                # ACT format uses a multiplier float, where detail = multiplier * 25ms
+                # We'll take the average delay of frames in action 
+                for action in act_data.actions:
+                    avg_delay = 25.0
+                    if action.frames:
+                        avg_delay = sum(f.delay for f in action.frames) / len(action.frames)
+                    
+                    factor = avg_delay / 25.0
+                    out.extend(struct.pack('<f', factor))
+                    
+            return bytes(out)
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to serialize ACT data: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _write_action(self, out: bytearray, action: ACTAction, version: Tuple[int, int]):
+        """Write action data."""
+        # Frame count
+        frame_count = len(action.frames)
+        out.extend(struct.pack('<i', frame_count))
+        
+        for frame in action.frames:
+            self._write_frame(out, frame, version)
+            
+    def _write_frame(self, out: bytearray, frame: ACTFrame, version: Tuple[int, int]):
+        """Write frame data."""
+        # Frame padding (32 bytes unknown)
+        out.extend(b'\x00' * 32)
+        
+        # Layer count
+        layer_count = len(frame.layers)
+        out.extend(struct.pack('<i', layer_count))
+        
+        for layer in frame.layers:
+            self._write_layer(out, layer, version)
+            
+        # Event ID - Version 2.0+
+        if version >= ACT_VERSION_2_0:
+            out.extend(struct.pack('<i', frame.event_id))
+            
+        # Anchors - Version 2.3+
+        if version >= ACT_VERSION_2_3:
+            anchor_count = len(frame.anchors)
+            out.extend(struct.pack('<i', anchor_count))
+            
+            for anchor in frame.anchors:
+                # 4 bytes unknown (reserved)
+                out.extend(b'\x00\x00\x00\x00')
+                out.extend(struct.pack('<i', anchor.x))
+                out.extend(struct.pack('<i', anchor.y))
+                out.extend(struct.pack('<i', anchor.attr))
+
+    def _write_layer(self, out: bytearray, layer: ACTLayer, version: Tuple[int, int]):
+        """Write layer data."""
+        # Position
+        out.extend(struct.pack('<i', layer.x))
+        out.extend(struct.pack('<i', layer.y))
+        
+        # Sprite index
+        out.extend(struct.pack('<i', layer.sprite_index))
+        
+        # Mirror
+        out.extend(struct.pack('<i', 1 if layer.mirror else 0))
+        
+        # Version 2.0+ extra fields
+        if version >= ACT_VERSION_2_0:
+            # Color (RGBA)
+            out.append(layer.color[0]) # R
+            out.append(layer.color[1]) # G
+            out.append(layer.color[2]) # B
+            out.append(layer.color[3]) # A
+            
+            # Scale X
+            out.extend(struct.pack('<f', layer.scale_x))
+            
+            # Scale Y - Version 2.4+
+            if version >= ACT_VERSION_2_4:
+                out.extend(struct.pack('<f', layer.scale_y))
+                
+            # Rotation
+            out.extend(struct.pack('<i', layer.rotation))
+            
+            # Sprite Type
+            out.extend(struct.pack('<i', layer.sprite_type))
+            
+            # Width/Height - Version 2.5+
+            if version >= ACT_VERSION_2_5:
+                out.extend(struct.pack('<i', layer.width))
+                out.extend(struct.pack('<i', layer.height))
+
     def _read_string(self, data: bytes, offset: int, 
                      max_length: int) -> Tuple[str, int]:
         """

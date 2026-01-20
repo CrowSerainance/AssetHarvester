@@ -809,6 +809,9 @@ class GRFBrowserWidget(QWidget):
         self.act_preview_controls = QHBoxLayout()
         self.act_preview_controls.addWidget(QLabel("Action:"))
         self.act_action_combo = QComboBox()
+        self.act_action_combo.setMinimumContentsLength(28)
+        self.act_action_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.act_action_combo.view().setMinimumWidth(280)
         self.act_action_combo.currentIndexChanged.connect(self._on_act_action_changed)
         self.act_preview_controls.addWidget(self.act_action_combo)
         self.act_play_btn = QPushButton("▶ Play")
@@ -1576,7 +1579,14 @@ class GRFBrowserWidget(QWidget):
         for idx in range(act_data.get_action_count()):
             action = act_data.get_action(idx)
             frame_count = action.get_frame_count() if action else 0
-            self.act_action_combo.addItem(f"Action {idx} ({frame_count} frames)", idx)
+            display_text = f"Action {idx} ({frame_count} frames)"
+            self.act_action_combo.addItem(display_text, idx)
+            item_index = self.act_action_combo.count() - 1
+            self.act_action_combo.setItemData(
+                item_index,
+                display_text,
+                Qt.ItemDataRole.ToolTipRole
+            )
         # Pick a sensible default action (first drawable), not always Action 0.
         best_action = self._find_first_drawable_action(act_data, spr_data)
         combo_index = self.act_action_combo.findData(best_action)

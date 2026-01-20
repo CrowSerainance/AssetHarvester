@@ -73,3 +73,10 @@ ActEditor-main/
 .claude-temp-files-7/
 .claude-temp-files-8/
 .claude-temp-files-9/
+# AI Configuration
+.gemini/
+.cursor/
+.windsurf/
+.copilot/
+.claude/
+

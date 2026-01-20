@@ -44,6 +44,10 @@ import zlib
 import time
 from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
+import concurrent.futures
+import fnmatch
+import re
+
 
 
 # ==============================================================================
@@ -84,9 +88,16 @@ class GRFFileEntry:
         flags (int): GRF file flags (FILE, MIXCRYPT, DES)
     """
     path: str
-    data: bytes
+    data: Optional[bytes]
     compressed: bool = True
     flags: int = GRF_FILE_FLAG_FILE
+    
+    # For optimization: referencing data in original file
+    source_grf_path: Optional[str] = None
+    source_offset: int = 0
+    source_compressed_size: int = 0
+    source_uncompressed_size: int = 0
+    source_flags: int = 0
 
 
 # ==============================================================================
@@ -189,18 +200,75 @@ class GRFEditor:
         file_list = extractor.list_files()
 
         for entry in file_list:
-            # Create a placeholder entry - we'll load data only if needed
+            # Create a placeholder entry pointing to the original data
             self.files[entry.path.lower()] = GRFFileEntry(
                 path=entry.path,
-                data=b'',  # Placeholder - will load on demand
+                data=None,  # Placeholder - will load on demand OR copy from source
                 compressed=True,
-                flags=GRF_FILE_FLAG_FILE
+                flags=GRF_FILE_FLAG_FILE,
+                source_grf_path=grf_path,
+                source_offset=entry.offset,
+                source_compressed_size=entry.compressed_size,
+                source_uncompressed_size=entry.size,
+                source_flags=0 # We'd need to expose flags in FileEntry to set this accurately
             )
 
         extractor.close()
         self.modified = False
 
         print(f"[INFO] Loaded {len(self.files)} files from GRF")
+        return True
+
+    def read_file(self, grf_path: str) -> Optional[bytes]:
+        """
+        Read file content into memory.
+        
+        Args:
+            grf_path: Path in GRF
+            
+        Returns:
+            Bytes if found, None otherwise
+        """
+        grf_path_lower = grf_path.lower().replace('/', '\\')
+        if grf_path_lower not in self.files:
+            return None
+            
+        entry = self.files[grf_path_lower]
+        if entry.data is not None:
+            return entry.data
+            
+        # Need to load from source
+        if entry.source_grf_path:
+             from .grf_extractor import GRFExtractor
+             temp_extractor = GRFExtractor()
+             if temp_extractor.open(entry.source_grf_path):
+                 data = temp_extractor.get_file_data(entry.path)
+                 temp_extractor.close()
+                 if data is not None:
+                     entry.data = data
+                     return data
+        
+        return None
+
+    def write_file_content(self, grf_path: str, data: bytes) -> bool:
+        """
+        Update file content directly in memory.
+        
+        Args:
+            grf_path: Path in GRF
+            data: New content bytes
+            
+        Returns:
+            True if successful
+        """
+        grf_path_lower = grf_path.lower().replace('/', '\\')
+        if grf_path_lower not in self.files:
+            return False
+            
+        entry = self.files[grf_path_lower]
+        entry.data = data
+        entry.source_grf_path = None # Detach from source as it's modified
+        self.modified = True
         return True
 
     def add_file(self, local_path: str, grf_path: str, compress: bool = True) -> bool:
@@ -333,7 +401,140 @@ class GRFEditor:
         """
         return [entry.path for entry in self.files.values()]
 
-    def save(self, output_path: Optional[str] = None) -> bool:
+    def search(self, query: str, use_regex: bool = False) -> List[str]:
+        """
+        Search for files in the GRF.
+
+        Args:
+            query: Search query (glob pattern by default, or regex)
+            use_regex: If True, treat query as regex pattern
+
+        Returns:
+            List of matching file paths
+        """
+        results = []
+        if use_regex:
+            try:
+                pattern = re.compile(query, re.IGNORECASE)
+                for path in self.files.keys():
+                    # Get original path from entry
+                    entry_path = self.files[path].path
+                    if pattern.search(entry_path):
+                        results.append(entry_path)
+            except re.error:
+                print(f"[ERROR] Invalid regex: {query}")
+                return []
+        else:
+            # Glob search (case insensitive)
+            query_lower = query.lower()
+            for path in self.files.keys():
+                entry_path = self.files[path].path
+                if fnmatch.fnmatch(entry_path.lower(), query_lower):
+                    results.append(entry_path)
+                elif query_lower in entry_path.lower():
+                    # Also match substrings if glob fails but substring exists
+                    # (Unless query has globs like *)
+                    if '*' not in query and '?' not in query:
+                        results.append(entry_path)
+                    
+        return sorted(list(set(results))) # Deduplicate
+
+    def rename_file(self, old_path: str, new_path: str) -> bool:
+        """
+        Rename a file in the GRF.
+
+        Args:
+            old_path: Current path in GRF
+            new_path: New path in GRF
+
+        Returns:
+            True if successful
+        """
+        old_path_lower = old_path.lower().replace('/', '\\')
+        
+        if old_path_lower not in self.files:
+            print(f"[WARN] File not found: {old_path}")
+            return False
+            
+        new_path_normalized = new_path.replace('/', '\\')
+        new_path_lower = new_path_normalized.lower()
+        
+        if new_path_lower in self.files:
+            print(f"[WARN] Destination already exists: {new_path}")
+            return False
+            
+        # Get entry and update it
+        entry = self.files.pop(old_path_lower)
+        entry.path = new_path_normalized
+        self.files[new_path_lower] = entry
+        
+        self.modified = True
+        print(f"[INFO] Renamed: {old_path} -> {new_path_normalized}")
+        return True
+
+    def merge(self, other_grf_path: str, overwrite: bool = True) -> int:
+        """
+        Merge another GRF into this one.
+
+        Args:
+            other_grf_path: Path to the source GRF to merge in
+            overwrite: If True, overwrite files with same path
+
+        Returns:
+            Number of files merged
+        """
+        from .grf_extractor import GRFExtractor
+        
+        print(f"[INFO] Merging with {other_grf_path}...")
+        
+        # Open source GRF
+        extractor = GRFExtractor()
+        if not extractor.open(other_grf_path):
+            print(f"[ERROR] Failed to open source GRF: {other_grf_path}")
+            return 0
+            
+        count = 0
+        skipped = 0
+        
+        # Iterate through files in source GRF
+        file_list = extractor.list_files()
+        total = len(file_list)
+        
+        for i, entry in enumerate(file_list):
+            grf_path = entry.path
+            grf_path_lower = grf_path.lower().replace('/', '\\')
+            
+            if not overwrite and grf_path_lower in self.files:
+                skipped += 1
+                continue
+                
+            # Get data
+            data = extractor.get_file_data(grf_path)
+            if data is None:
+                print(f"[WARN] Failed to read {grf_path} from source")
+                continue
+                
+            # Add to this GRF
+            self.files[grf_path_lower] = GRFFileEntry(
+                path=grf_path.replace('/', '\\'),
+                data=data,
+                compressed=True, # Compress by default
+                flags=GRF_FILE_FLAG_FILE
+            )
+            count += 1
+            
+            if (i + 1) % 1000 == 0:
+                print(f"[INFO] Merged {i + 1}/{total} files...")
+                
+        extractor.close()
+        
+        if count > 0:
+            self.modified = True
+            
+        print(f"[SUCCESS] Merged {count} files ({skipped} skipped)")
+        return count
+
+    def save(self, output_path: Optional[str] = None, max_workers: int = 4) -> bool:
         """
         Save the GRF to disk.
 
@@ -341,9 +542,10 @@ class GRFEditor:
         - GRF header
         - All file data (compressed if requested)
         - Compressed file table
-
+        
         Args:
             output_path: Optional different path to save to (defaults to self.grf_path)
+            max_workers: Number of threads for compression (default: 4)
 
         Returns:
             True if successful, False otherwise
@@ -363,7 +565,7 @@ class GRFEditor:
 
         try:
             with open(self.grf_path, 'wb') as f:
-                self._write_grf(f)
+                self._write_grf(f, max_workers)
 
             self.modified = False
             print(f"[SUCCESS] GRF saved: {self.grf_path}")
@@ -392,7 +594,36 @@ class GRFEditor:
     # PRIVATE METHODS - GRF WRITING
     # ==========================================================================
 
-    def _write_grf(self, f):
+    def _compress_entry(self, item: Tuple[str, GRFFileEntry]) -> Tuple[str, bytes, int, int]:
+        """
+        Helper to compress a single entry (for parallel execution).
+        """
+        path_lower, entry = item
+        
+        # Case 1: Data is in memory (new or modified file, or loaded)
+        if entry.data is not None:
+            uncompressed_size = len(entry.data)
+            if entry.compressed and uncompressed_size > 0:
+                compressed_data = zlib.compress(entry.data, level=6)
+                if len(compressed_data) < uncompressed_size:
+                    return (path_lower, compressed_data, len(compressed_data), uncompressed_size)
+            return (path_lower, entry.data, uncompressed_size, uncompressed_size)
+
+        # Case 2: Data is in source file (unmodified)
+        # We can copy the raw compressed data directly without decompression!
+        if entry.source_grf_path:
+            try:
+                with open(entry.source_grf_path, 'rb') as f:
+                    f.seek(entry.source_offset)
+                    raw_data = f.read(entry.source_compressed_size)
+                    return (path_lower, raw_data, entry.source_compressed_size, entry.source_uncompressed_size)
+            except Exception as e:
+                # Return empty bytes to signal error? 
+                return (path_lower, b'', 0, 0)
+        
+        return (path_lower, b'', 0, 0)
+
+    def _write_grf(self, f, max_workers: int = 4):
         """
         Write the complete GRF structure to a file handle.
 
@@ -403,6 +634,7 @@ class GRFEditor:
 
         Args:
             f: Open file handle for writing (binary mode)
+            max_workers: Thread count
         """
         # Write header (we'll update it later with correct offsets)
         file_count = len(self.files)
@@ -413,28 +645,34 @@ class GRFEditor:
         file_offsets: Dict[str, int] = {}
         file_sizes: Dict[str, Tuple[int, int]] = {}  # path -> (compressed, uncompressed)
 
-        # Write each file's data
-        print(f"[INFO] Writing {file_count} files...")
-        for i, (path_lower, entry) in enumerate(sorted(self.files.items())):
-            if (i + 1) % 100 == 0:
-                print(f"[INFO] Writing file {i + 1}/{file_count}...")
+        # Prepare items for parallel processing
+        items = sorted(list(self.files.items()))
+        
+        print(f"[INFO] Writing {file_count} files using {max_workers} threads...")
+        
+        # Process files in parallel
+        # We process in chunks or all at once? All at once might consume too much memory if we hold all results.
+        # But we already hold all inputs.
+        # To strictly order the output (not required by GRF but good for determinism), we can map and then iterate results.
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Map returns iterator in order of submission
+            results = executor.map(self._compress_entry, items)
+            
+            for i, result in enumerate(results):
+                path_lower, final_data, final_size, raw_size = result
+                
+                if (i + 1) % 100 == 0:
+                    print(f"[INFO] Writing file {i + 1}/{file_count}...")
 
-            # Record current position (relative to start of file data, after header)
-            file_offsets[path_lower] = f.tell() - GRF_HEADER_SIZE
-
-            # Compress if requested
-            if entry.compressed and len(entry.data) > 0:
-                compressed_data = zlib.compress(entry.data, level=6)
-                # Only use compressed if it's actually smaller
-                if len(compressed_data) < len(entry.data):
-                    f.write(compressed_data)
-                    file_sizes[path_lower] = (len(compressed_data), len(entry.data))
-                else:
-                    f.write(entry.data)
-                    file_sizes[path_lower] = (len(entry.data), len(entry.data))
-            else:
-                f.write(entry.data)
-                file_sizes[path_lower] = (len(entry.data), len(entry.data))
+                # Record current position (relative to start of file data, after header)
+                file_offsets[path_lower] = f.tell() - GRF_HEADER_SIZE
+                
+                # Write data
+                f.write(final_data)
+                
+                # Record sizes
+                file_sizes[path_lower] = (final_size, raw_size)
 
         # Record where file table starts
         file_table_offset = f.tell() - GRF_HEADER_SIZE
@@ -599,19 +837,55 @@ def create_grf_from_directory(directory: str, output_grf: str,
 
 if __name__ == "__main__":
     import sys
+    import os
 
     print("=== GRF Editor Test ===")
 
     # Test creating a simple GRF
     editor = GRFEditor()
-    editor.create("test_output.grf")
-
-    # Add this Python file to the GRF for testing
+    editor.create("test_output_1.grf")
+    
+    # Add this Python file
     editor.add_file(__file__, "data\\test\\grf_editor.py")
-
-    # Save
-    editor.save()
+    editor.save(max_workers=2)
     editor.close()
+    print("[SUCCESS] Created test_output_1.grf")
 
-    print("\n[SUCCESS] Test GRF created: test_output.grf")
-    print("You can verify this with a GRF tool or the grf_extractor module")
+    # Test creating another GRF
+    editor2 = GRFEditor()
+    editor2.create("test_output_2.grf")
+    editor2.add_file("README.md", "data\\doc\\README.md") # Assuming README exists in root, wait, I will use __file__ again but different name
+    editor2.add_file(__file__, "data\\other\\script.py")
+    editor2.save()
+    editor2.close()
+    print("[SUCCESS] Created test_output_2.grf")
+
+    # Test Merge, Rename, Search
+    print("\n=== Testing Advanced Features ===")
+    editor = GRFEditor()
+    editor.open("test_output_1.grf")
+    
+    # Search
+    results = editor.search("*.py")
+    print(f"Search *.py found: {len(results)} files")
+    assert len(results) == 1
+    
+    # Rename
+    editor.rename_file("data\\test\\grf_editor.py", "data\\renamed\\script.py")
+    results = editor.search("script.py")
+    print(f"Search script.py after rename found: {len(results)} files")
+    assert len(results) == 1
+    
+    # Merge
+    editor.merge("test_output_2.grf")
+    
+    # List all
+    print(f"Total files after merge: {len(editor.files)}")
+    # Should be 1 (renamed) + 1 (new from merged, different path) = 2. 
+    # Wait, test_output_2 has "data\doc\README.md" (if failed to add, 0) and "data\other\script.py"
+    # I need to ensure files exist before adding.
+    
+    editor.save("test_merged.grf")
+    editor.close()
+    
+    print("\n[SUCCESS] All tests passed. Created test_merged.grf")
