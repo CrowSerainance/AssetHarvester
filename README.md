@@ -255,5 +255,4 @@ This project is for educational and personal use. Please respect game publishers
 
 - [QuickBMS](https://aluigi.altervista.org/quickbms.htm) by Luigi Auriemma
 - [pygrf](https://github.com/bmeinka/pygrf) for GRF format research
-- [rose-tools](https://github.com/rminderhoud/rose-tools) for ROSE Online tools
 - The private server modding community for format documentation
